@@ -10,11 +10,11 @@ import threading
 from flask import Flask, request, jsonify
 import os
 
-# ==================== 系统基础基础配置 ====================
+# ==================== 系统基础配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8617895746:AAEwaL8az2XWxS_tY9X14qs2_yrCWRc6Xrs"
-WEB_URL = "https://xiaogenban-666k.onrender.com"
+TOKEN = "8617895746:AAE2JUTR-caS9gKjcBIoHmb2GkTjb-QkHR4"
+WEB_URL = "https://xiaogenban-666j.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 # 创始人最高权力UID
@@ -41,7 +41,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS settings
                  (group_id INTEGER PRIMARY KEY, operators TEXT DEFAULT '[]', exchange_rate REAL DEFAULT 7.2,
                   fee_rate REAL DEFAULT 0, is_active INTEGER DEFAULT 0, language TEXT DEFAULT 'chinese',
-                  timezone TEXT DEFAULT 'Asia/Shanghai', show_usdt INTEGER DEFAULT 1)''')
+                  timezone TEXT DEFAULT 'Asia/Shanghai', show_usdt INTEGER DEFAULT 1, expire_time TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS bills
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, user_id INTEGER, username TEXT,
                   remark TEXT, amount REAL, usdt_amount REAL, exchange_rate REAL, bill_type TEXT,
@@ -91,7 +91,7 @@ def get_current_time(timezone_str):
         now = datetime.now(tz)
         return now, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-# ==================== 权限分级系统 ====================
+# ==================== 权限与商用1天试用期判定核心 ====================
 def get_all_masters():
     masters = list(FOUNDER_USERS)
     try:
@@ -135,6 +135,32 @@ def is_vip_user(user_id):
     except: pass
     return False
 
+def check_group_validity(group_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT expire_time FROM settings WHERE group_id = ?", (group_id,))
+    row = c.fetchone()
+    
+    if not row:
+        tz_str = 'Asia/Shanghai'
+        _, _, full_time_str = get_current_time(tz_str)
+        trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
+        conn.commit()
+        conn.close()
+        return True, trial_expire
+
+    conn.close()
+    group_expire_str = row[0]
+    
+    if group_expire_str:
+        group_expire = datetime.strptime(group_expire_str, "%Y-%m-%d %H:%M:%S")
+        if datetime.now() < group_expire:
+            return True, group_expire_str
+            
+    return False, group_expire_str
+
 def can_use(group_id, user_id):
     if is_master(user_id) or is_vip_user(user_id): return True
     try:
@@ -150,7 +176,7 @@ def get_setting(group_id, key):
         row = c.fetchone()
         conn.close()
         if not row: return None
-        cols = ['group_id', 'operators', 'exchange_rate', 'fee_rate', 'is_active', 'language', 'timezone', 'show_usdt']
+        cols = ['group_id', 'operators', 'exchange_rate', 'fee_rate', 'is_active', 'language', 'timezone', 'show_usdt', 'expire_time']
         return dict(zip(cols, row)).get(key)
     except: return None
 
@@ -162,8 +188,9 @@ def update_setting(group_id, key, value):
         if c.fetchone():
             c.execute(f"UPDATE settings SET {key} = ? WHERE group_id = ?", (value, group_id))
         else:
-            c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1))
+            trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
             c.execute(f"UPDATE settings SET {key} = ? WHERE group_id = ?", (value, group_id))
         conn.commit()
         conn.close()
@@ -196,9 +223,9 @@ def add_bill(group_id, user_id, username, remark, amount, bill_type, exchange_ra
 def get_class_bills_by_date(group_id, target_date):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT remark, username, amount, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND date_str = ? AND bill_type = 'income' ORDER BY id DESC", (group_id, target_date))
+    c.execute("SELECT remark, username, amount, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND date_str = ? AND bill_type = 'income' ORDER BY id ASC", (group_id, target_date))
     income = c.fetchall()
-    c.execute("SELECT remark, username, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND date_str = ? AND bill_type = 'expense' ORDER BY id DESC", (group_id, target_date))
+    c.execute("SELECT remark, username, usdt_amount, exchange_rate, timestamp FROM bills WHERE group_id = ? AND date_str = ? AND bill_type = 'expense' ORDER BY id ASC", (group_id, target_date))
     expense = c.fetchall()
     c.execute("SELECT SUM(amount), SUM(usdt_amount) FROM bills WHERE group_id = ? AND date_str = ? AND bill_type = 'income'", (group_id, target_date))
     total_income = c.fetchone()
@@ -207,7 +234,54 @@ def get_class_bills_by_date(group_id, target_date):
     conn.close()
     return income, expense, total_income, total_expense
 
-# ==================== 网页端明细对账看板（样式对齐） ====================
+# ==================== 统一账目文本渲染引擎 ====================
+async def send_text_bill_report(update, gid, target_date):
+    rate = get_setting(gid, 'exchange_rate') or 7.2
+    income, expense, total_income, total_expense = get_class_bills_by_date(gid, target_date)
+
+    total_rmb = total_income[0] if (total_income and total_income[0]) else 0
+    total_usdt = total_income[1] if (total_income and total_income[1]) else 0
+    expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
+    remaining_usdt = total_usdt - expense_usdt
+
+    report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
+    
+    report += "📥 <b>入款:</b>\n"
+    if income:
+        for row in income:
+            remark, username, amount, usdt_amount, ex_rate, timestamp = row
+            time_str = timestamp[11:16] if timestamp else "00:00"
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}={usdt_amount:.1f}U{rem_part}\n"
+    else:
+        report += "  暂无任何入款数据\n"
+
+    if expense:
+        report += "\n📤 <b>下发:</b>\n"
+        for row in expense:
+            remark, username, usdt_amount, ex_rate, timestamp = row
+            time_str = timestamp[11:16] if timestamp else "00:00"
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} 下发 {usdt_amount:.1f}U{rem_part}\n"
+
+    report += f"\n💰 <b>汇率:</b> {rate:.2f}\n"
+    report += f"📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n"
+    report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
+    report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}"),
+            InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{update.current_message.bot.username if hasattr(update, 'current_message') else ''}?start=help")
+        ]
+    ]
+    
+    if update.message:
+        await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+# ==================== 网页端明细对账看板 ====================
 @flask_app.route('/')
 def index():
     return '''<!DOCTYPE html>
@@ -418,6 +492,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.effective_chat.type == "private":
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
+        
+        if context.args and context.args[0] == "help":
+            guide = "📚 <b>记账基础指令速查表：</b>\n\n`+1000` - 极速入款\n`备注+5000` - 带有备注录入\n`下发500` - 快速下发USDT\n`+0` - 查看今日即时账单汇总板"
+            await update.message.reply_text(guide, parse_mode="Markdown")
+            return
+
         welcome = (
             "<b>我是记账机器人</b>\n\n"
             "点击这里把机器人加进群➕\n\n"
@@ -511,6 +591,41 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚙️ <b>设置群内操作记账员命令：</b>\n\n在群内直接发：\n👉 <code>设置操作人 @用户名</code>\n👉 <code>删除操作人 @用户名</code>", parse_mode="HTML")
         elif text == "开启/关闭计算功能":
             await update.message.reply_text("💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
+        
+        # 👑 【核心新增：大老板私聊远程强行解绑清除群功能】
+        elif text.startswith("解绑群组"):
+            if not is_master(uid):
+                await update.message.reply_text("❌ <b>鉴权失败：此项为高级毁灭性指令，仅限创始人主控执行！</b>", parse_mode="HTML")
+                return
+            
+            # 解析提取指令后面的群组ID
+            target_gid_str = text.replace("解绑群组", "").strip()
+            if not target_gid_str:
+                await update.message.reply_text("⚠️ <b>格式不完整。示例：</b> `解绑群组 -100123456789`", parse_mode="Markdown")
+                return
+            
+            try:
+                target_gid = int(target_gid_str)
+                conn = get_db_connection()
+                c = conn.cursor()
+                # 连根拔起：清除该群所有账单明细和设定
+                c.execute("DELETE FROM settings WHERE group_id = ?", (target_gid,))
+                c.execute("DELETE FROM bills WHERE group_id = ?", (target_gid,))
+                conn.commit()
+                conn.close()
+                
+                # 尝试让机器人远程自动退出该群聊
+                try:
+                    await context.bot.leave_chat(chat_id=target_gid)
+                    status_text = "并且机器人已成功主动切断并退出了该群聊！"
+                except Exception as le:
+                    status_text = f"但机器人退群失败（可能已经被踢或无权限），本地数据已被抹除。错误: {str(le)}"
+                
+                await update.message.reply_text(f"🗑️ <b>清空解绑成功！</b>\n\n目标群组 <code>{target_gid}</code> 的所有本地历史账目、授权设定已被连根铲除，{status_text}", parse_mode="HTML")
+            except Exception as ex:
+                await update.message.reply_text(f"❌ <b>解绑异常：格式有误或系统数据库锁死。原因: {str(ex)}</b>", parse_mode="HTML")
+            return
+
         elif text.startswith("指派二级主人"):
             if not (uid in FOUNDER_USERS or is_vip_user(uid)): return
             if len(get_dynamic_masters_by_creator(uid)) >= 5 and uid not in FOUNDER_USERS:
@@ -529,6 +644,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("❌ 格式不正确。示例：`指派二级主人 8179896441`")
         return
 
+    # --- 群组内核心业务逻辑判定 ---
+    is_valid, expire_date_str = check_group_validity(gid)
+    if not is_valid:
+        if is_master(uid) or is_vip_user(uid):
+            await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成商用买家多群激活授权面板。", parse_mode="HTML")
+        return
+
     if text == '上课':
         if not can_use(gid, uid): return
         update_setting(gid, 'is_active', 1)
@@ -539,8 +661,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not can_use(gid, uid): return
         if (get_setting(gid, 'is_active') or 0) == 0: return
         update_setting(gid, 'is_active', 0)
-        keyboard = [[InlineKeyboardButton("📊 查看完整账单明细 (Web)", url=f"{WEB_URL}?group_id={gid}")]]
-        await update.message.reply_text("🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        
+        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+        now, _, _ = get_current_time(tz_str)
+        today_str = now.strftime("%Y-%m-%d")
+        
+        await update.message.reply_text("🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str)
         return
 
     if text.startswith('设置操作人'):
@@ -581,15 +708,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if (get_setting(gid, 'is_active') or 0) == 0 or not can_use(gid, uid): return
 
+    tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+    now, _, _ = get_current_time(tz_str)
+    today_str = now.strftime("%Y-%m-%d")
+
     if text == '+0':
-        keyboard = [[InlineKeyboardButton("📊 实时对账多维看板 (Web)", url=f"{WEB_URL}?group_id={gid}")]]
-        await update.message.reply_text("📋 <b>点击下方查看实时对账：</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str)
         return
 
     m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
     if m_exp:
         add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
-        await update.message.reply_text(f"✅ 下发成功！点击原链接或输入 <code>+0</code> 刷新看板。", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str)
         return
 
     m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
@@ -600,7 +730,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sign == '-': amt = -amt
         c_rate = float(m_inc.group(4)) if m_inc.group(4) else None
         add_bill(gid, uid, username, rem, amt, 'income', c_rate)
-        await update.message.reply_text(f"📥 入款录入成功！点击原链接或输入 <code>+0</code> 刷新看板。", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str)
         return
 
 # ==================== 买家上交截图审核网关 ====================
@@ -631,7 +761,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    print("🤖 100%样式还原多维商用版本已正常发动...")
+    print("🤖 统一大板报账单格式商用版本已就绪...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
