@@ -14,14 +14,12 @@ import os
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = "8617895746:AAF2vwr4laJ9GDKYwuyAJjNAMrf_TDjPu-0"
-WEB_URL = "https://xiaogenban-666t.onrender.com"
+WEB_URL = "https://xiaogenban-666gg.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
-# 创始人最高权力UID
 FOUNDER_USERS = [8179896441]
 TRON_ADDRESS = "TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw"
 
-# 商业套餐定价
 PRICE_1_MONTH = 80
 PRICE_2_MONTH = 130
 PRICE_3_MONTH = 220
@@ -143,7 +141,7 @@ def check_group_validity(group_id):
     
     if not row:
         tz_str = 'Asia/Shanghai'
-        _, _, full_time_str = get_current_time(tz_str)
+        _, _, trial_expire = get_current_time(tz_str)
         trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
         c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
@@ -717,6 +715,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成多群独立授权面板。", parse_mode="HTML")
         return
 
+    # 📌 先获取基础环境数据，给记账提供时间基础
+    tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+    now, _, _ = get_current_time(tz_str)
+    today_str = now.strftime("%Y-%m-%d")
+
     if text == '上课':
         if not can_use(gid, uid): return
         update_setting(gid, 'is_active', 1)
@@ -725,11 +728,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text == '下课':
         if not can_use(gid, uid): return
-        if (get_setting(gid, 'is_active') or 0) == 0: return
         update_setting(gid, 'is_active', 0)
-        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
-        now, _, _ = get_current_time(tz_str)
-        today_str = now.strftime("%Y-%m-%d")
         await update.message.reply_text("🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", parse_mode="HTML")
         await send_text_bill_report(update, gid, today_str)
         return
@@ -769,7 +768,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ <b>删除失败，无法在本地指引中反查到该用户名。</b>")
         return
 
-    # 🛠️【核心新增功能 1】：支持“改语言”指令切换
     if text == '改语言':
         if not can_use(gid, uid): return
         current_lang = get_setting(gid, 'language') or 'chinese'
@@ -779,7 +777,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"<b>{lang_tips}</b>", parse_mode="HTML")
         return
 
-    # 🛠️【核心新增功能 2】：支持“设置时间 china/myanmar”时区变更
     if text.startswith('设置时间'):
         if not can_use(gid, uid): return
         arg = text.replace('设置时间', '').strip().lower()
@@ -793,13 +790,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ 格式错误。请使用：\n`设置时间 china` (北京时区)\n`设置时间 myanmar` (缅甸时区)", parse_mode="Markdown")
         return
 
-    # 🛠️【核心新增功能 3】：支持高级删除指令集（删今天 / 删最后 / 全部清单 / 清单+备注）
     if text in ['删今天', '删最後']:
         if not can_use(gid, uid): return
-        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
-        now, _, _ = get_current_time(tz_str)
-        today_str = now.strftime("%Y-%m-%d")
-        
         conn = get_db_connection()
         c = conn.cursor()
         c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today_str))
@@ -837,15 +829,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         c.execute("DELETE FROM bills WHERE group_id = ?", (gid,))
         conn.commit()
         conn.close()
-        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
-        now, _, _ = get_current_time(tz_str)
         await update.message.reply_text("🚨 <b>历史大扫除完成！本群在数据库中的历史所有账单已被彻底永久清空！</b>", parse_mode="HTML")
-        await send_text_bill_report(update, gid, now.strftime("%Y-%m-%d"))
+        await send_text_bill_report(update, gid, today_str)
         return
 
     if text.startswith('清单'):
         if not can_use(gid, uid): return
-        # 兼容“清单+备注”和“清单 备注”格式
         target_remark = text.replace('清单', '').replace('+', '').strip()
         if not target_remark:
             await update.message.reply_text("⚠️ <b>请输入具体的备注名称！例如：`清单张三` 或 `清单+李四`</b>", parse_mode="Markdown")
@@ -859,28 +848,34 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             c.execute("DELETE FROM bills WHERE group_id = ? AND remark = ?", (gid, target_remark))
             conn.commit()
             conn.close()
-            tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
-            now, _, _ = get_current_time(tz_str)
             await update.message.reply_text(f"🔥 <b>成功清理！已永久删除备注为 [{target_remark}] 的全部账单流水（共计 {count} 笔）。</b>", parse_mode="HTML")
-            await send_text_bill_report(update, gid, now.strftime("%Y-%m-%d"))
+            await send_text_bill_report(update, gid, today_str)
         else:
             conn.close()
             await update.message.reply_text(f"🔍 <b>未找到备注为 [{target_remark}] 的任何记账记录。</b>", parse_mode="HTML")
         return
 
-    # --- 以下保持原有的普通加减记账解析流 ---
-    if (get_setting(gid, 'is_active') or 0) == 0 or not can_use(gid, uid): return
+    # ==================== 账目输入拦截流 ====================
+    # 📌 检查本群是否已经发送了“上课”激活
+    if (get_setting(gid, 'is_active') or 0) == 0:
+        return
+        
+    # 📌 检查发话人是否有操作记账权限
+    if not can_use(gid, uid): 
+        return
 
     if text == '+0':
         await send_text_bill_report(update, gid, today_str)
         return
 
+    # 🛠️ 修复解析：下发/Thut 记账格式匹配器 (下发50 / 备注下发50)
     m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
     if m_exp:
         add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
         await send_text_bill_report(update, gid, today_str)
         return
 
+    # 🛠️ 修复解析：经典加减入账格式匹配器 (+1000 / 备注+1000)
     m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
     if m_inc:
         rem = m_inc.group(1).strip()
