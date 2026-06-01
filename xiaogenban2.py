@@ -13,8 +13,8 @@ import os
 # ==================== 系统基础配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8617895746:AAE2JUTR-caS9gKjcBIoHmb2GkTjb-QkHR4"
-WEB_URL = "https://xiaogenban-666j.onrender.com"
+TOKEN = "8617895746:AAHSfWHaxY9td6OKGXkh-KuUK2e3nF9DRtw"
+WEB_URL = "https://xiaogenban-666h.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 # 创始人最高权力UID
@@ -91,7 +91,7 @@ def get_current_time(timezone_str):
         now = datetime.now(tz)
         return now, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-# ==================== 权限与商用1天试用期判定核心 ====================
+# ==================== 权限判定核心 ====================
 def get_all_masters():
     masters = list(FOUNDER_USERS)
     try:
@@ -252,7 +252,7 @@ async def send_text_bill_report(update, gid, target_date):
             remark, username, amount, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
             rem_part = f" ({remark})" if remark else ""
-            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}={usdt_amount:.1f}U{rem_part}\n"
+            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U{rem_part}\n"
     else:
         report += "  暂无任何入款数据\n"
 
@@ -269,17 +269,66 @@ async def send_text_bill_report(update, gid, target_date):
     report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
     report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
 
+    # 🛠️ 【修改点：将Web和Help按钮改为垂直上下排列，收紧页面外观宽度】
+    bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
+    if not bot_username:
+        try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
+        except: bot_username = "xiaogenban_bot"
+        
     keyboard = [
-        [
-            InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}"),
-            InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{update.current_message.bot.username if hasattr(update, 'current_message') else ''}?start=help")
-        ]
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")],
+        [InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{bot_username}?start=help")]
     ]
     
     if update.message:
         await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     elif update.callback_query:
         await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+# ==================== 动态生成中缅双语帮助文本引擎 ====================
+def generate_help_text(lang='chinese'):
+    if lang == 'myanmar':
+        return """🤖 *စာရင်းကိုင်ဘော့ အကူအညီ* (Help)
+📌 *စာရင်းသွင်းရန် ပုံစံများ：*
+`+1000` - Ngwe Win 1000 Kyat
+`-1000` - Ngwe Win -1000 Kyat
+`备注+2000` - 带备注入款
+`备注-2000` - 带备注减款
+`Thut50` / `下发50` - 50 USDT Thut Ranyan
+`备注下发50` - 带备注下发
+`+0` - YaNay SaYinChoke KyiRanyan
+
+📌 *စီမံခန့်ခွဲရေး ကွတ်ကီးများ：*
+`上课` - 开启记账系统
+`下课` - 关闭记账并清算今日
+`设置汇率 7.2` - 修改群常规汇率
+`设置操作人 @用户名` - 授权群成员协助记账
+`查看操作员列表` - 查看本群操作人
+`改语言` - 切换语言 (中文/မြန်မာ)
+`设置时间 china/myanmar` - 变更结算时区"""
+    else:
+        return """🤖 *记账机器人使用指南*
+📌 *记账格式：*
+`+1000` - 入款1000元
+`-1000` - 入款-1000元 (扣减款)
+`备注+2000` - 带备注入款
+`备注-2000` - 带备注减款
+`下发50` / `ထုတ်50` - 下发50 USDT
+`备注下发50` - 带备注下发50 USDT
+`+0` - 查看今日汇总
+
+📌 *管理命令：*
+`上课` - 开启记账模式
+`下课` - 关闭记账模式并归档
+`设置汇率 7.2` - 设置当前常规汇率
+`设置操作人 @用户名` - 授权群成员协助记账（可直接@或回复消息）
+`查看操作员列表` - 查看本群操作人
+`改语言` - 切换群内系统语言（中文/缅甸语）
+`设置时间 china/myanmar` - 调整本群结算时区
+
+📌 *删除命令：*
+`删今天` - 清空今日账单 | `删最后` - 撤销最后一笔
+`全部清单` - 清空历史 | `清单+备注` - 删除指定备注账单"""
 
 # ==================== 网页端明细对账看板 ====================
 @flask_app.route('/')
@@ -479,11 +528,12 @@ def api_bill():
 
 # ==================== 私聊常驻大键盘 ====================
 def get_private_reply_keyboard():
+    # 🛠️ 【修改点：将原“如何设置群内操作人”强行修改为“取掉权限人”】
     keyboard = [
         [KeyboardButton("试用"), KeyboardButton("开始")],
         [KeyboardButton("到期时间"), KeyboardButton("详细说明书")],
         [KeyboardButton("自助续费"), KeyboardButton("如何设置权限人")],
-        [KeyboardButton("如何设置群内操作人"), KeyboardButton("开启/关闭计算功能")]
+        [KeyboardButton("取掉权限人"), KeyboardButton("开启/关闭计算功能")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="请选择下方业务菜单面板")
 
@@ -493,9 +543,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
         
+        # 🛠️ 【修改点：当群组账单下方的 Help 按钮跳转过来时，直接吐出标准双语说明书】
         if context.args and context.args[0] == "help":
-            guide = "📚 <b>记账基础指令速查表：</b>\n\n`+1000` - 极速入款\n`备注+5000` - 带有备注录入\n`下发500` - 快速下发USDT\n`+0` - 查看今日即时账单汇总板"
-            await update.message.reply_text(guide, parse_mode="Markdown")
+            await update.message.reply_text(generate_help_text('chinese'), parse_mode="Markdown")
+            await update.message.reply_text(generate_help_text('myanmar'), parse_mode="Markdown")
             return
 
         welcome = (
@@ -573,8 +624,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if row: await update.message.reply_text(f"📅 您的商用买家VIP多群授权截止时间为：\n<code>{row[0]}</code>", parse_mode="HTML")
             else: await update.message.reply_text("⚠️ <b>您目前无任何有效商用授权。请选择 [自助续费] 订购。</b>", parse_mode="HTML")
         elif text == "详细说明书":
-            guide = "📚 <b>记账基础指令速查表：</b>\n\n`+1000` - 极速入款\n`备注+5000` - 带备注录入\n`下发500` - 快速下发USDT\n`+0` - 查看今日即时账单"
-            await update.message.reply_text(guide, parse_mode="Markdown")
+            await update.message.reply_text(generate_help_text('chinese'), parse_mode="Markdown")
+            await update.message.reply_text(generate_help_text('myanmar'), parse_mode="Markdown")
         elif text == "自助续费":
             renew_msg = (
                 f"💰 <b>【多群记账系统自动套餐购买中心】</b>\n\n"
@@ -586,41 +637,61 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             await update.message.reply_text(renew_msg, parse_mode="HTML")
         elif text == "如何设置权限人":
-            await update.message.reply_text("👑 <b>添加/管理二级主人权限：</b>\n\n回复文字发送：`指派二级主人 12345678` (纯数字UID)\n\n*(每个买家最多支持添加 5 个协助二级主人)*")
-        elif text == "如何设置群内操作人":
-            await update.message.reply_text("⚙️ <b>设置群内操作记账员命令：</b>\n\n在群内直接发：\n👉 <code>设置操作人 @用户名</code>\n👉 <code>删除操作人 @用户名</code>", parse_mode="HTML")
-        elif text == "开启/关闭计算功能":
-            await update.message.reply_text("💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
+            await update.message.reply_text("👑 <b>添加二级主人权限：</b>\n\n私聊发送指令：`指派二级主人 12345678` (后面换成目标用户的纯数字UID)\n\n*(每个买家最多支持添加 5 个协助二级主人)*")
         
-        # 👑 【核心新增：大老板私聊远程强行解绑清除群功能】
+        # 🛠️ 【修改点：点击“取掉权限人”大键盘，处理移除二级主人的业务说明与操作入口】
+        elif text == "取掉权限人":
+            if not (uid in FOUNDER_USERS or is_vip_user(uid)):
+                await update.message.reply_text("❌ 您当前没有订购商用套餐，无权管理分销人。")
+                return
+            masters = get_dynamic_masters_by_creator(uid)
+            if not masters:
+                await update.message.reply_text("💡 <b>您目前还没有指派过任何二级新主人。</b>", parse_mode="HTML")
+                return
+            
+            tips = "🗑️ <b>【撤销二级新主人特权中心】</b>\n\n发送下方对应的完整格式指令即可踢出授权：\n\n"
+            for m_uid, m_name in masters:
+                tips += f"👤 UID: <code>{m_uid}</code>\n👉 复制指令：`解除二级主人 {m_uid}`\n--------------------\n"
+            await update.message.reply_text(tips, parse_mode="HTML")
+            
+        elif text.startswith("解除二级主人"):
+            if not (uid in FOUNDER_USERS or is_vip_user(uid)): return
+            clean_uid = "".join(filter(str.isdigit, text))
+            if len(clean_uid) >= 5:
+                t_mid = int(clean_uid)
+                conn = get_db_connection()
+                c = conn.cursor()
+                if uid in FOUNDER_USERS:
+                    c.execute("DELETE FROM dynamic_masters WHERE user_id = ?", (t_mid,))
+                else:
+                    c.execute("DELETE FROM dynamic_masters WHERE user_id = ? AND added_by = ?", (t_mid, uid))
+                conn.commit()
+                conn.close()
+                await update.message.reply_text(f"🔥 <b>成功剥夺！二级新主人 (UID: {t_mid}) 的所有管理权限已被彻底清除。</b>", parse_mode="HTML")
+            else:
+                await update.message.reply_text("❌ 格式不正确。示例：`解除二级主人 8179896441`")
+
         elif text.startswith("解绑群组"):
             if not is_master(uid):
                 await update.message.reply_text("❌ <b>鉴权失败：此项为高级毁灭性指令，仅限创始人主控执行！</b>", parse_mode="HTML")
                 return
-            
-            # 解析提取指令后面的群组ID
             target_gid_str = text.replace("解绑群组", "").strip()
             if not target_gid_str:
                 await update.message.reply_text("⚠️ <b>格式不完整。示例：</b> `解绑群组 -100123456789`", parse_mode="Markdown")
                 return
-            
             try:
                 target_gid = int(target_gid_str)
                 conn = get_db_connection()
                 c = conn.cursor()
-                # 连根拔起：清除该群所有账单明细和设定
                 c.execute("DELETE FROM settings WHERE group_id = ?", (target_gid,))
                 c.execute("DELETE FROM bills WHERE group_id = ?", (target_gid,))
                 conn.commit()
                 conn.close()
-                
-                # 尝试让机器人远程自动退出该群聊
                 try:
                     await context.bot.leave_chat(chat_id=target_gid)
                     status_text = "并且机器人已成功主动切断并退出了该群聊！"
                 except Exception as le:
                     status_text = f"但机器人退群失败（可能已经被踢或无权限），本地数据已被抹除。错误: {str(le)}"
-                
                 await update.message.reply_text(f"🗑️ <b>清空解绑成功！</b>\n\n目标群组 <code>{target_gid}</code> 的所有本地历史账目、授权设定已被连根铲除，{status_text}", parse_mode="HTML")
             except Exception as ex:
                 await update.message.reply_text(f"❌ <b>解绑异常：格式有误或系统数据库锁死。原因: {str(ex)}</b>", parse_mode="HTML")
@@ -642,9 +713,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"✅ <b>指派成功！二级主人 (UID: {t_mid}) 已获得分销系统协同管理特权。</b>", parse_mode="HTML")
             else:
                 await update.message.reply_text("❌ 格式不正确。示例：`指派二级主人 8179896441`")
+        elif text == "开启/关闭计算功能":
+            await update.message.reply_text("💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
         return
 
-    # --- 群组内核心业务逻辑判定 ---
+    # --- 群组内核心业务逻辑 ---
     is_valid, expire_date_str = check_group_validity(gid)
     if not is_valid:
         if is_master(uid) or is_vip_user(uid):
@@ -661,11 +734,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not can_use(gid, uid): return
         if (get_setting(gid, 'is_active') or 0) == 0: return
         update_setting(gid, 'is_active', 0)
-        
         tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
         now, _, _ = get_current_time(tz_str)
         today_str = now.strftime("%Y-%m-%d")
-        
         await update.message.reply_text("🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", parse_mode="HTML")
         await send_text_bill_report(update, gid, today_str)
         return
@@ -680,7 +751,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             t_id = update.message.reply_to_message.from_user.id
             u_obj = update.message.reply_to_message.from_user
             show_name = f"@{u_obj.username}" if u_obj.username else u_obj.first_name
-        
         if t_id:
             ops = json.loads(get_setting(gid, 'operators') or '[]')
             if t_id not in ops: ops.append(t_id)
@@ -704,6 +774,16 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"❌ <b>已成功撤销 {show_name} 的群组官方记账操作员权限。</b>", parse_mode="HTML")
         else:
             await update.message.reply_text("⚠️ <b>删除失败，无法在本地指引中反查到该用户名。</b>")
+        return
+
+    # 切换群内系统语言（中文/缅甸语）
+    if text == '改语言':
+        if not can_use(gid, uid): return
+        current_lang = get_setting(gid, 'language') or 'chinese'
+        new_lang = 'myanmar' if current_lang == 'chinese' else 'chinese'
+        update_setting(gid, 'language', new_lang)
+        lang_tips = "🇲🇲 系统语言已切换为：缅甸语" if new_lang == 'myanmar' else "🇨🇳 系统语言已切换为：中文"
+        await update.message.reply_text(f"<b>{lang_tips}</b>", parse_mode="HTML")
         return
 
     if (get_setting(gid, 'is_active') or 0) == 0 or not can_use(gid, uid): return
