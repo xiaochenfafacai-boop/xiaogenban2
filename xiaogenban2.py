@@ -14,7 +14,7 @@ import os
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = "8617895746:AAF2vwr4laJ9GDKYwuyAJjNAMrf_TDjPu-0"
-WEB_URL = "https://xiaogenban-666gg.onrender.com"
+WEB_URL = "https://xiaogenban-668gg.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
@@ -273,8 +273,7 @@ async def send_text_bill_report(update, gid, target_date):
         except: bot_username = "xiaogenban_bot"
         
     keyboard = [
-        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")],
-        [InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{bot_username}?start=help")]
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
     ]
     
     if update.message:
