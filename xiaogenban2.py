@@ -13,8 +13,8 @@ import os
 # ==================== 系统基础配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8617895746:AAHSfWHaxY9td6OKGXkh-KuUK2e3nF9DRtw"
-WEB_URL = "https://xiaogenban-666h.onrender.com"
+TOKEN = "8617895746:AAF2vwr4laJ9GDKYwuyAJjNAMrf_TDjPu-0"
+WEB_URL = "https://xiaogenban-666t.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 # 创始人最高权力UID
@@ -269,14 +269,14 @@ async def send_text_bill_report(update, gid, target_date):
     report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
     report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
 
-    # 🛠️ 【修改点：将Web和Help按钮改为垂直上下排列，收紧页面外观宽度】
     bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
     if not bot_username:
         try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
         except: bot_username = "xiaogenban_bot"
         
     keyboard = [
-        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")],
+        [InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{bot_username}?start=help")]
     ]
     
     if update.message:
@@ -527,7 +527,6 @@ def api_bill():
 
 # ==================== 私聊常驻大键盘 ====================
 def get_private_reply_keyboard():
-    # 🛠️ 【修改点：将原“如何设置群内操作人”强行修改为“取掉权限人”】
     keyboard = [
         [KeyboardButton("试用"), KeyboardButton("开始")],
         [KeyboardButton("到期时间"), KeyboardButton("详细说明书")],
@@ -542,7 +541,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
         
-        # 🛠️ 【修改点：当群组账单下方的 Help 按钮跳转过来时，直接吐出标准双语说明书】
         if context.args and context.args[0] == "help":
             await update.message.reply_text(generate_help_text('chinese'), parse_mode="Markdown")
             await update.message.reply_text(generate_help_text('myanmar'), parse_mode="Markdown")
@@ -637,8 +635,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(renew_msg, parse_mode="HTML")
         elif text == "如何设置权限人":
             await update.message.reply_text("👑 <b>添加二级主人权限：</b>\n\n私聊发送指令：`指派二级主人 12345678` (后面换成目标用户的纯数字UID)\n\n*(每个买家最多支持添加 5 个协助二级主人)*")
-        
-        # 🛠️ 【修改点：点击“取掉权限人”大键盘，处理移除二级主人的业务说明与操作入口】
         elif text == "取掉权限人":
             if not (uid in FOUNDER_USERS or is_vip_user(uid)):
                 await update.message.reply_text("❌ 您当前没有订购商用套餐，无权管理分销人。")
@@ -669,7 +665,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"🔥 <b>成功剥夺！二级新主人 (UID: {t_mid}) 的所有管理权限已被彻底清除。</b>", parse_mode="HTML")
             else:
                 await update.message.reply_text("❌ 格式不正确。示例：`解除二级主人 8179896441`")
-
         elif text.startswith("解绑群组"):
             if not is_master(uid):
                 await update.message.reply_text("❌ <b>鉴权失败：此项为高级毁灭性指令，仅限创始人主控执行！</b>", parse_mode="HTML")
@@ -690,12 +685,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     await context.bot.leave_chat(chat_id=target_gid)
                     status_text = "并且机器人已成功主动切断并退出了该群聊！"
                 except Exception as le:
-                    status_text = f"但机器人退群失败（可能已经被踢或无权限），本地数据已被抹除。错误: {str(le)}"
+                    status_text = f"but 机器人退群失败，本地数据已被抹除。错误: {str(le)}"
                 await update.message.reply_text(f"🗑️ <b>清空解绑成功！</b>\n\n目标群组 <code>{target_gid}</code> 的所有本地历史账目、授权设定已被连根铲除，{status_text}", parse_mode="HTML")
             except Exception as ex:
-                await update.message.reply_text(f"❌ <b>解绑异常：格式有误或系统数据库锁死。原因: {str(ex)}</b>", parse_mode="HTML")
+                await update.message.reply_text(f"❌ <b>解绑异常：错误原因: {str(ex)}</b>", parse_mode="HTML")
             return
-
         elif text.startswith("指派二级主人"):
             if not (uid in FOUNDER_USERS or is_vip_user(uid)): return
             if len(get_dynamic_masters_by_creator(uid)) >= 5 and uid not in FOUNDER_USERS:
@@ -720,7 +714,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     is_valid, expire_date_str = check_group_validity(gid)
     if not is_valid:
         if is_master(uid) or is_vip_user(uid):
-            await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成商用买家多群激活授权面板。", parse_mode="HTML")
+            await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成多群独立授权面板。", parse_mode="HTML")
         return
 
     if text == '上课':
@@ -775,21 +769,107 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ <b>删除失败，无法在本地指引中反查到该用户名。</b>")
         return
 
-    # 切换群内系统语言（中文/缅甸语）
+    # 🛠️【核心新增功能 1】：支持“改语言”指令切换
     if text == '改语言':
         if not can_use(gid, uid): return
         current_lang = get_setting(gid, 'language') or 'chinese'
         new_lang = 'myanmar' if current_lang == 'chinese' else 'chinese'
         update_setting(gid, 'language', new_lang)
-        lang_tips = "🇲🇲 系统语言已切换为：缅甸语" if new_lang == 'myanmar' else "🇨🇳 系统语言已切换为：中文"
+        lang_tips = "🇲🇲 系统语言已切换为：缅甸语 (Myanmar)" if new_lang == 'myanmar' else "🇨🇳 系统语言已切换为：中文 (Chinese)"
         await update.message.reply_text(f"<b>{lang_tips}</b>", parse_mode="HTML")
         return
 
-    if (get_setting(gid, 'is_active') or 0) == 0 or not can_use(gid, uid): return
+    # 🛠️【核心新增功能 2】：支持“设置时间 china/myanmar”时区变更
+    if text.startswith('设置时间'):
+        if not can_use(gid, uid): return
+        arg = text.replace('设置时间', '').strip().lower()
+        if 'china' in arg or '中国' in arg:
+            update_setting(gid, 'timezone', 'Asia/Shanghai')
+            await update.message.reply_text("🇨🇳 <b>结算时区已变更为：北京时间 (Asia/Shanghai)</b>", parse_mode="HTML")
+        elif 'myanmar' in arg or '缅甸' in arg:
+            update_setting(gid, 'timezone', 'Asia/Yangon')
+            await update.message.reply_text("🇲🇲 <b>结算时区已变更为：缅甸仰光时间 (Asia/Yangon)</b>", parse_mode="HTML")
+        else:
+            await update.message.reply_text("⚠️ 格式错误。请使用：\n`设置时间 china` (北京时区)\n`设置时间 myanmar` (缅甸时区)", parse_mode="Markdown")
+        return
 
-    tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
-    now, _, _ = get_current_time(tz_str)
-    today_str = now.strftime("%Y-%m-%d")
+    # 🛠️【核心新增功能 3】：支持高级删除指令集（删今天 / 删最后 / 全部清单 / 清单+备注）
+    if text in ['删今天', '删最後']:
+        if not can_use(gid, uid): return
+        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+        now, _, _ = get_current_time(tz_str)
+        today_str = now.strftime("%Y-%m-%d")
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today_str))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("🧹 <b>清空成功！今日记录的所有账单流水已被全部抹除。</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str)
+        return
+
+    if text == '删最后':
+        if not can_use(gid, uid): return
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT id, remark, amount, bill_type, date_str FROM bills WHERE group_id = ? ORDER BY id DESC LIMIT 1", (gid,))
+        row = c.fetchone()
+        if row:
+            b_id, b_rem, b_amt, b_type, b_date = row
+            c.execute("DELETE FROM bills WHERE id = ?", (b_id,))
+            conn.commit()
+            conn.close()
+            type_name = "入款" if b_type == 'income' else "下发"
+            amt_show = f"{b_amt:.0f}元" if b_type == 'income' else f"{b_amt:.1f}U"
+            rem_show = f"({b_rem})" if b_rem else ""
+            await update.message.reply_text(f"🗑️ <b>已成功撤销最后一笔账单：</b>\n流水号: {b_id} | {type_name}: {amt_show} {rem_show}", parse_mode="HTML")
+            await send_text_bill_report(update, gid, b_date)
+        else:
+            conn.close()
+            await update.message.reply_text("⚠️ <b>本群目前没有任何可以撤销的账单流水。</b>", parse_mode="HTML")
+        return
+
+    if text == '全部清单':
+        if not can_use(gid, uid): return
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM bills WHERE group_id = ?", (gid,))
+        conn.commit()
+        conn.close()
+        tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+        now, _, _ = get_current_time(tz_str)
+        await update.message.reply_text("🚨 <b>历史大扫除完成！本群在数据库中的历史所有账单已被彻底永久清空！</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, now.strftime("%Y-%m-%d"))
+        return
+
+    if text.startswith('清单'):
+        if not can_use(gid, uid): return
+        # 兼容“清单+备注”和“清单 备注”格式
+        target_remark = text.replace('清单', '').replace('+', '').strip()
+        if not target_remark:
+            await update.message.reply_text("⚠️ <b>请输入具体的备注名称！例如：`清单张三` 或 `清单+李四`</b>", parse_mode="Markdown")
+            return
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM bills WHERE group_id = ? AND remark = ?", (gid, target_remark))
+        count = c.fetchone()[0]
+        if count > 0:
+            c.execute("DELETE FROM bills WHERE group_id = ? AND remark = ?", (gid, target_remark))
+            conn.commit()
+            conn.close()
+            tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
+            now, _, _ = get_current_time(tz_str)
+            await update.message.reply_text(f"🔥 <b>成功清理！已永久删除备注为 [{target_remark}] 的全部账单流水（共计 {count} 笔）。</b>", parse_mode="HTML")
+            await send_text_bill_report(update, gid, now.strftime("%Y-%m-%d"))
+        else:
+            conn.close()
+            await update.message.reply_text(f"🔍 <b>未找到备注为 [{target_remark}] 的任何记账记录。</b>", parse_mode="HTML")
+        return
+
+    # --- 以下保持原有的普通加减记账解析流 ---
+    if (get_setting(gid, 'is_active') or 0) == 0 or not can_use(gid, uid): return
 
     if text == '+0':
         await send_text_bill_report(update, gid, today_str)
