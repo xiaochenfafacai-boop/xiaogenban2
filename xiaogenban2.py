@@ -276,8 +276,7 @@ async def send_text_bill_report(update, gid, target_date):
         except: bot_username = "xiaogenban_bot"
         
     keyboard = [
-        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")],
-        [InlineKeyboardButton("📚 帮助 (Help)", url=f"https://t.me/{bot_username}?start=help")]
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
     ]
     
     if update.message:
