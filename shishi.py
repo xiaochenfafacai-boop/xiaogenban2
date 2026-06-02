@@ -13,7 +13,7 @@ import requests
 # ==================== 1. 系统核心配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8617895746:AAEBvO1jf8LR5VEp_zfG_SSbToZ9_DzG9X4')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8617895746:AAEK4-npKZkbycTtTkHiTfmE9tmiJuWHG7k')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-668gg.onrender.com')
 PORT = int(os.environ.get('PORT', 5000))
 
@@ -27,16 +27,19 @@ flask_app = Flask(__name__)
 def fetch_blockchain_usdt_info(address):
     USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/json'
     }
     try:
-        account_url = f"https://apilist.tronscanapi.com/api/account/token_balance?address={address}&token={USDT_CONTRACT}"
+        # 修正后的 Tronscan 账户 Token 查询接口
+        account_url = f"https://apilist.tronscanapi.com/api/account/tokens?address={address}"
         response = requests.get(account_url, headers=headers, timeout=10)
         usdt_balance = 0.0
         
         if response.status_code == 200:
             data = response.json()
-            token_list = data.get('data', data if isinstance(data, list) else [])
+            # 兼容处理返回的 token 列表结构
+            token_list = data.get('data', data.get('tokens', []))
             for token in token_list:
                 if token.get('tokenId') == USDT_CONTRACT or token.get('token_id') == USDT_CONTRACT:
                     raw_amount = token.get('balance', token.get('amount', 0))
@@ -45,20 +48,21 @@ def fetch_blockchain_usdt_info(address):
         else:
             return {"success": False, "msg": f"Tronscan 节点异常 ({response.status_code})"}
         
+        # 获取转账流水的接口保持健壮性
         tx_url = f"https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=5&start=0&sort=-timestamp&contract_address={USDT_CONTRACT}&relatedAddress={address}"
         history_text = ""
         try:
             tx_response = requests.get(tx_url, headers=headers, timeout=10)
             if tx_response.status_code == 200:
                 tx_data = tx_response.json()
-                tx_list = tx_data.get('token_transfers', [])
+                tx_list = tx_data.get('token_transfers', tx_data.get('data', []))
                 if not tx_list:
                     history_text = "  暂无最近的 USDT 转账流水。"
                 else:
                     for tx in tx_list:
                         from_addr = tx.get('from_address', '')
                         to_addr = tx.get('to_address', '')
-                        amount = float(tx.get('quant', 0)) / 1000000
+                        amount = float(tx.get('quant', tx.get('amount', 0))) / 1000000
                         if from_addr.lower() == address.lower():
                             direction = "🔴 支出"
                             peer_info = f"去往: {to_addr[:6]}***{to_addr[-6:]}"
@@ -108,8 +112,9 @@ def get_current_time(timezone_str='Asia/Shanghai'):
         now = datetime.now(tz)
         return now, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-def is_vip_user(user_id):
-    if user_id in FOUNDER_USERS: return True
+def get_vip_expire_time(user_id):
+    if user_id in FOUNDER_USERS: 
+        return True, "永久终身授权"
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -118,9 +123,12 @@ def is_vip_user(user_id):
         conn.close()
         if row:
             expire = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            return datetime.now() < expire
+            if datetime.now() < expire:
+                return True, row[0]
+            else:
+                return False, row[0]
     except: pass
-    return False
+    return False, "未激活"
 
 def add_vip_months(user_id, username, months):
     conn = get_db_connection()
@@ -130,8 +138,11 @@ def add_vip_months(user_id, username, months):
     
     now = datetime.now()
     if row:
-        current_expire = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-        base_time = current_expire if current_expire > now else now
+        try:
+            current_expire = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            base_time = current_expire if current_expire > now else now
+        except:
+            base_time = now
     else:
         base_time = now
         
@@ -317,8 +328,16 @@ def handle_all_messages(message):
     uid = message.from_user.id
     username = message.from_user.first_name or "用户"
 
+    # 问题 2：自助续费文案补充价格体系
     if text == "自助续费":
-        reply = f"💎 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code>\n\n转账后直接发截图给机器人即可申请。"
+        reply = (
+            f"💎 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code>\n\n"
+            f"💰 <b>授权价格套餐：</b>\n"
+            f"• 1 个月：<b>80</b> RMB / U\n"
+            f"• 2 个月：<b>140</b> RMB / U\n"
+            f"• 3 个月：<b>230</b> RMB / U\n\n"
+            f"⚠️ 转账后直接把【交易成功截图】发送给机器人即可完成自动申请核验。"
+        )
         bot.reply_to(message, reply, parse_mode="HTML")
         return
 
@@ -326,10 +345,11 @@ def handle_all_messages(message):
         bot.reply_to(message, "📖 请发送 /help 查看完整的功能命令帮助指南。")
         return
 
+    # 问题 3：到期时间加入精确时间展示
     if text == "到期时间":
-        is_vip = is_vip_user(uid)
-        status = "🟢 VIP 激活中" if is_vip else "🔴 已到期"
-        bot.reply_to(message, f"👤 权限状态: {status}")
+        is_active, expire_time = get_vip_expire_time(uid)
+        status = "🟢 VIP 激活中" if is_active else "🔴 已到期/未激活"
+        bot.reply_to(message, f"👤 <b>权限状态</b>: {status}\n📅 <b>到期时间</b>: <code>{expire_time}</code>", parse_mode="HTML")
         return
 
     # 🔍 链上实时查询
@@ -351,7 +371,8 @@ def handle_all_messages(message):
 
     # =============== 以下功能仅限在群组内使用且需要授权 ===============
     if message.chat.type in ["group", "supergroup"]:
-        if not is_vip_user(uid): return 
+        is_active, _ = get_vip_expire_time(uid)
+        if not is_active: return 
         now, _, _ = get_current_time()
         today_str = now.strftime("%Y-%m-%d")
 
@@ -458,14 +479,12 @@ def handle_all_messages(message):
             send_text_bill_report(gid, gid, today_str)
             return
 
-        # 支持 备注+下发 (例如: 额外费用下发500)
         m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
         if m_exp:
             add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
             send_text_bill_report(gid, gid, today_str)
             return
 
-        # 支持 备注+入款（带备注或不带均可，例如: 项目公款+5000 或者 +1000/7.3）
         m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
         if m_inc:
             rem = m_inc.group(1).strip()
@@ -478,6 +497,7 @@ def handle_all_messages(message):
             return
 
 # ==================== 6. 🌐 Web 前端与 API 看板 ====================
+# 问题 4：已完全对换网页布局，使明细在上，总计卡片在底部
 @flask_app.route('/')
 def index():
     return '''<!DOCTYPE html>
@@ -494,11 +514,11 @@ def index():
         .date-picker-area { margin: 10px 0; background: #f8fafc; padding: 8px; border-radius: 6px; display: flex; align-items: center; justify-content: center; gap: 8px; border: 1px dashed #cbd5e1; }
         .date-picker-area label { font-size: 13px; font-weight: bold; color: #475569; }
         .date-input { padding: 6px 10px; border-radius: 4px; border: 1px solid #cbd5e1; font-size: 14px; color: #1e293b; outline: none; cursor: pointer; font-weight: bold; }
-        .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 25px; border-top: 2px dashed #cbd5e1; padding-top: 20px; }
         .card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center; }
         .card .title { font-size: 12px; color: #64748b; }
         .card .value { font-size: 18px; font-weight: bold; margin-top: 2px; }
-        h3 { font-size: 15px; margin: 20px 0 8px 0; padding-left: 6px; border-left: 4px solid #3b82f6; color: #1e293b; }
+        h3 { font-size: 15px; margin: 25px 0 8px 0; padding-left: 6px; border-left: 4px solid #3b82f6; color: #1e293b; }
         .cate-title { border-left-color: #10b981; }
         .exp-title { border-left-color: #ef4444; }
         table { width: 100%; border-collapse: collapse; margin-top: 5px; font-size: 13px; background: #fff; border-radius: 6px; overflow: hidden; }
@@ -519,6 +539,29 @@ def index():
                 <input type="date" id="date-select" class="date-input" onchange="dateChanged(this.value)">
             </div>
         </div>
+
+        <!-- 1. 📥 进单明细 (移到最上方) -->
+        <h3>📥 进单明细</h3>
+        <table>
+            <thead><tr><th>时间</th><th>备注项目</th><th>金额(RMB)</th><th>折合(U)</th></tr></thead>
+            <tbody id="income-list"></tbody>
+        </table>
+
+        <!-- 2. 📤 下发记录明细 (移到第二) -->
+        <h3 class="exp-title">📤 下发记录明细</h3>
+        <table>
+            <thead><tr><th>时间</th><th>下发备注</th><th>下发金额(USDT)</th><th>操作人</th></tr></thead>
+            <tbody id="expense-list"></tbody>
+        </table>
+
+        <!-- 3. 🗂️ 备注分类统计 (移到第三) -->
+        <h3 class="cate-title">🗂️ 备注分类统计</h3>
+        <table>
+            <thead><tr><th>项目备注</th><th>总金额(RMB)</th><th>折合(USDT)</th><th>笔数</th></tr></thead>
+            <tbody id="cate-list"></tbody>
+        </table>
+
+        <!-- 4. 常规数据总计面板 (移到最下方) -->
         <div class="summary-grid">
             <div class="card"><div class="title">常规汇率</div><div class="value" id="rate">0.00</div></div>
             <div class="card"><div class="title">总入款 (RMB)</div><div class="value" id="total_rmb">0</div></div>
@@ -526,21 +569,6 @@ def index():
             <div class="card" style="background:#fef2f2;"><div class="title">已下发 (USDT)</div><div class="value" style="color:#dc2626;" id="expense_usdt">0U</div></div>
             <div class="card" style="grid-column: span 2; background:#eff6ff;"><div class="title">未下发尾款 (USDT)</div><div class="value" style="color:#1d4ed8; font-size:20px;" id="remaining_usdt">0U</div></div>
         </div>
-        <h3 class="cate-title">🗂️ 备注分类统计</h3>
-        <table>
-            <thead><tr><th>项目备注</th><th>总金额(RMB)</th><th>折合(USDT)</th><th>笔数</th></tr></thead>
-            <tbody id="cate-list"></tbody>
-        </table>
-        <h3>📥 进单明细</h3>
-        <table>
-            <thead><tr><th>时间</th><th>备注项目</th><th>金额(RMB)</th><th>折合(U)</th></tr></thead>
-            <tbody id="income-list"></tbody>
-        </table>
-        <h3 class="exp-title">📤 下发记录明细</h3>
-        <table>
-            <thead><tr><th>时间</th><th>下发备注</th><th>下发金额(USDT)</th><th>操作人</th></tr></thead>
-            <tbody id="expense-list"></tbody>
-        </table>
     </div>
     <script>
         const params = new URLSearchParams(window.location.search);
