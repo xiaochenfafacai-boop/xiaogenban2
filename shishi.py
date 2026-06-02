@@ -23,32 +23,28 @@ TRON_ADDRESS = "TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw"
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 flask_app = Flask(__name__)
 
-# ==================== 2. 🌐 核心重构：波场链上数据抓取引擎 ====================
+# ==================== 2. 🌐 波场链上数据抓取引擎 ====================
 def fetch_blockchain_usdt_info(address):
     USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
-        # ✨ 升级：采用精度更高的单一 token 查询接口，防止被其他垃圾代币干扰
         account_url = f"https://apilist.tronscanapi.com/api/account/token_balance?address={address}&token={USDT_CONTRACT}"
         response = requests.get(account_url, headers=headers, timeout=10)
         usdt_balance = 0.0
         
         if response.status_code == 200:
             data = response.json()
-            # Tronscan 此接口通常直接返回数组或带 data 的列表
             token_list = data.get('data', data if isinstance(data, list) else [])
             for token in token_list:
                 if token.get('tokenId') == USDT_CONTRACT or token.get('token_id') == USDT_CONTRACT:
-                    # 优先取 balance，其次取 amount
                     raw_amount = token.get('balance', token.get('amount', 0))
                     usdt_balance = float(raw_amount) / 1000000.0
                     break
         else:
-            return {"success": False, "msg": f"Tronscan 节点响应异常 (状态码: {response.status_code})"}
+            return {"success": False, "msg": f"Tronscan 节点异常 ({response.status_code})"}
         
-        # 抓取流水的接口保持高容错
         tx_url = f"https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=5&start=0&sort=-timestamp&contract_address={USDT_CONTRACT}&relatedAddress={address}"
         history_text = ""
         try:
@@ -71,7 +67,7 @@ def fetch_blockchain_usdt_info(address):
                             peer_info = f"来自: {from_addr[:6]}***{from_addr[-6:]}"
                         history_text += f"  {direction} | <b>{amount:.2f} U</b>\n  └ <i>{peer_info}</i>\n"
             else:
-                history_text = "  ⚠️ 暂时无法获取流水明细（频率受限），请稍后再试。"
+                history_text = "  ⚠️ 暂时无法获取流水明细（频率受限）。"
         except:
             history_text = "  ⚠️ 链上网络拥堵，流水加载失败。"
 
@@ -175,6 +171,14 @@ def update_setting(group_id, key, value):
         conn.close()
     except: pass
 
+def is_operator(group_id, user_id):
+    if user_id in FOUNDER_USERS: return True
+    ops_str = get_setting(group_id, 'operators') or '[]'
+    try:
+        ops = json.loads(ops_str)
+        return user_id in ops
+    except: return False
+
 # ==================== 4. 📊 记账数据业务层 ====================
 def add_bill(group_id, user_id, username, remark, amount, bill_type, exchange_rate=None):
     if exchange_rate is None:
@@ -238,7 +242,7 @@ def send_text_bill_report(chat_id, gid, target_date):
     markup.add(telebot.types.InlineKeyboardButton("📊 查看完整网页账单", url=f"{WEBHOOK_URL}?group_id={gid}"))
     bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=markup)
 
-# ==================== 5. 💬 Telegram 消息事件网关 ====================
+# ==================== 5. 💬 Telegram 核心控制指令扩展网关 ====================
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     gid = message.chat.id
@@ -247,18 +251,22 @@ def cmd_start(message):
         "👉 <b>群内核心记账命令：</b>\n"
         "• 发送 <code>上课</code> / <code>下课</code> 开启或封存账单\n"
         "• 发送 <code>+1000</code> 或 <code>+1000/7.3</code> 记入款\n"
+        "• 发送 <code>项目公款+5000</code> 记带备注账目\n"
         "• 发送 <code>下发500</code> 记下发\n"
         "• 发送 <code>+0</code> 查看对账大底\n\n"
-        "💳 <b>私聊自助购买：</b>\n"
-        "直接在私聊中发送 <b><u>自助续费</u></b> 即可获取收款地址并提交凭证。"
+        "⚙️ <b>高阶财务群管命令（仅限操作人）：</b>\n"
+        "• <code>设置汇率 7.35</code> - 一键调整当前汇率\n"
+        "• <code>设置操作人 @username</code> - 授权他人共同记账管理\n"
+        "• <code>清单 备注名</code> - 过滤查询指定备注名下的所有进单明细\n"
+        "• <code>删最后</code> - 撤销最后一笔错误记账\n"
+        "• <code>删今天</code> - 清空今天的所有账单记录\n"
+        "• <code>删全部</code> - 清空本群历史所有未清算数据"
     )
     bot.send_message(gid, welcome, parse_mode="HTML")
 
 @bot.message_handler(content_types=['photo'])
 def handle_receipt_photo(message):
-    if message.chat.type != "private":
-        return 
-        
+    if message.chat.type != "private": return 
     uid = message.from_user.id
     username = message.from_user.username or "无用户名"
     first_name = message.from_user.first_name or "买家"
@@ -273,40 +281,33 @@ def handle_receipt_photo(message):
     
     for founder in FOUNDER_USERS:
         try:
-            bot.send_message(founder, f"🔔 <b>收到新的自助续费申请！</b>\n\n👤 买家: {first_name} (@{username})\n🆔 UID: <code>{uid}</code>\n👇 请核验下方截图并选择是否批准授权：", parse_mode="HTML")
+            bot.send_message(founder, f"🔔 <b>收到新的自助续费申请！</b>\n\n👤 买家: {first_name} (@{username})\n🆔 UID: <code>{uid}</code>", parse_mode="HTML")
             bot.send_photo(founder, photo_id, reply_markup=markup)
-        except Exception as e:
-            logging.error(f"转发审核图失败: {e}")
-            
-    bot.reply_to(message, "⏳ <b>凭证已成功提交！</b>\n系统正在通知老板进行后台双重对账审核，审核通过后系统将自动为您下发 VIP 授权，请耐心等待 1-3 分钟。")
+        except: pass
+    bot.reply_to(message, "⏳ <b>凭证已成功提交！</b> 系统正在核验，请耐心等待 1-3 分钟。")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('auth_'))
 def handle_auth_buttons(call):
     if call.from_user.id not in FOUNDER_USERS:
         bot.answer_callback_query(call.id, "⚠️ 您不是创始人，无权审核！", show_alert=True)
         return
-        
     data_parts = call.data.split('_')
     action = data_parts[1]
     
     if action == "reject":
         buyer_id = int(data_parts[2])
-        try: bot.send_message(buyer_id, "❌ <b>您的续费申请已被拒绝。</b>\n原因：财务未核验到账，请检查账单截图是否正确，或联系老板人工处理。", parse_mode="HTML")
+        try: bot.send_message(buyer_id, "❌ <b>您的续费申请已被拒绝。</b>", parse_mode="HTML")
         except: pass
         bot.edit_message_caption("❌ 已驳回该买家的凭证申请。", chat_id=call.message.chat.id, message_id=call.message.message_id)
     else:
         months = int(action)
         buyer_id = int(data_parts[2])
         buyer_name = data_parts[3]
-        
         expire_str = add_vip_months(buyer_id, buyer_name, months)
-        
         try:
-            success_text = f"🎉 <b>恭喜！您的自助续费申请已通过审核！</b>\n\n🎁 系统已为您成功开通 <b>{months}</b> 个月的 VIP 记账授权！\n⏳ 到期时间: <code>{expire_str}</code>\n\n现在您可以随时在名下群组发送 <code>上课</code> 开始安全记账了！"
-            bot.send_message(buyer_id, success_text, parse_mode="HTML")
+            bot.send_message(buyer_id, f"🎉 <b>您的自助续费申请已通过审核！开通 {months} 个月 VIP 授权。</b>", parse_mode="HTML")
         except: pass
-        
-        bot.edit_message_caption(f"✅ 审核成功！已成功为该用户充值 {months} 个月 VIP 授权。\n截止日期: {expire_str}", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        bot.edit_message_caption(f"✅ 审核成功！到期时间: {expire_str}", chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.answer_callback_query(call.id, "操作成功！")
 
 @bot.message_handler(func=lambda m: True)
@@ -317,74 +318,133 @@ def handle_all_messages(message):
     username = message.from_user.first_name or "用户"
 
     if text == "自助续费":
-        reply = (
-            "💎 <b>小跟班机器人自助续费中心</b>\n\n"
-            f"📌 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code> (点击可自动复制)\n\n"
-            "💵 <b>商业套餐定价：</b>\n"
-            "• 1 个月试用包：80 USDT\n"
-            "• 3 个月豪华包：220 USDT\n\n"
-            "ℹ️ <b>续费流程：</b> 往上方地址转账对应金额后，<b>直接把【转账成功截图】发给本机器人</b>。系统会自动向老板申请秒开通！"
-        )
+        reply = f"💎 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code>\n\n转账后直接发截图给机器人即可申请。"
         bot.reply_to(message, reply, parse_mode="HTML")
         return
 
     if text == "详细说明书":
-        reply = (
-            "📖 <b>小跟班记账功能完整使用说明书</b>\n\n"
-            "🟩 <b>1. 入款记账格式</b>\n"
-            "• 格式一：<code>+1000</code>\n"
-            "• 格式二：<code>项目公款+5000/7.25</code> (带汇率/备注)\n\n"
-            "🟥 <b>2. 下发记账格式</b>\n"
-            "• 格式：<code>下发500</code> 或 <code>小陈下发1200</code>\n\n"
-            "🟦 <b>3. 辅助快捷键</b>\n"
-            "• <code>+0</code> 随时呼出当前对账大底\n"
-            "• <code>查看 (波场地址)</code> 随时核对链上USDT流向"
-        )
-        bot.reply_to(message, reply, parse_mode="HTML")
-        return
-
-    if text in ["如何设置权限人", "取掉权限人", "开启/关闭计算功能"]:
-        bot.reply_to(message, f"💡 <b>提示：</b>\n大群内直接发送 <code>上课</code> 启动记账，<code>下课</code> 自动关账封存。普通群员无法干扰账目。")
+        bot.reply_to(message, "📖 请发送 /help 查看完整的功能命令帮助指南。")
         return
 
     if text == "到期时间":
         is_vip = is_vip_user(uid)
-        status = "🟢 VIP 激活中（有效）" if is_vip else "🔴 已到期或未开通"
-        bot.reply_to(message, f"👤 <b>您的授权状态：</b>\n\n权限状态: {status}\n提示：如需续费请点击键盘上的 [自助续费] 提交凭证。")
+        status = "🟢 VIP 激活中" if is_vip else "🔴 已到期"
+        bot.reply_to(message, f"👤 权限状态: {status}")
         return
 
+    # 🔍 链上实时查询
     if text.startswith("查看"):
         parts = text.split()
         if len(parts) >= 2:
             target_address = parts[1].strip()
             if target_address.startswith("T") and len(target_address) == 34:
-                wait_msg = bot.reply_to(message, "🔍 正在连接波场TRON全节点检索链上实时资产，请稍候...")
+                wait_msg = bot.reply_to(message, "🔍 正在连接波场TRON全节点检索实时资产...")
                 chain_res = fetch_blockchain_usdt_info(target_address)
                 try: bot.delete_message(gid, wait_msg.message_id)
                 except: pass
-                
                 if chain_res["success"]:
-                    report_text = (
-                        f"👤 <b>查询目标地址：</b>\n<code>{target_address}</code>\n\n"
-                        f"💰 <b>USDT 当前余额：</b> <code>{chain_res['balance']:.2f}</code> U\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 <b>最近 5 笔链上流向明细：</b>\n\n{chain_res['history']}"
-                    )
+                    report_text = f"👤 <b>查询地址：</b>\n<code>{target_address}</code>\n\n💰 <b>USDT 当前余额：</b> <code>{chain_res['balance']:.2f}</code> U\n━━━━━━━━━━━━━━━━━━\n📊 <b>流向明细：</b>\n{chain_res['history']}"
                     bot.reply_to(message, report_text, parse_mode="HTML")
                 else:
-                    bot.reply_to(message, f"❌ 链上检索失败，原因：{chain_res['msg']}")
+                    bot.reply_to(message, f"❌ 检索失败: {chain_res['msg']}")
                 return
 
+    # =============== 以下功能仅限在群组内使用且需要授权 ===============
     if message.chat.type in ["group", "supergroup"]:
-        if not is_vip_user(uid):
-            return 
-            
+        if not is_vip_user(uid): return 
         now, _, _ = get_current_time()
         today_str = now.strftime("%Y-%m-%d")
 
+        # 1️⃣ 设置汇率功能
+        if text.startswith("设置汇率"):
+            if not is_operator(gid, uid):
+                bot.reply_to(message, "⚠️ 只有群操作人或老板才能修改汇率。")
+                return
+            try:
+                new_rate = float(text.replace("设置汇率", "").strip())
+                update_setting(gid, 'exchange_rate', new_rate)
+                bot.reply_to(message, f"✅ 汇率已成功调整为: <b>{new_rate:.2f}</b>", parse_mode="HTML")
+            except:
+                bot.reply_to(message, "❌ 格式错误！请输入如: `设置汇率 7.3`")
+            return
+
+        # 2️⃣ 设置操作人功能
+        if text.startswith("设置操作人"):
+            if uid not in FOUNDER_USERS:
+                bot.reply_to(message, "⚠️ 只有创始人(老板)才能委任群操作人。")
+                return
+            if message.reply_to_message:
+                target_id = message.reply_to_message.from_user.id
+                target_name = message.reply_to_message.from_user.first_name
+            else:
+                bot.reply_to(message, "💡 请【回复】那个需要被设置为操作人的用户的消息，并发送 `设置操作人`")
+                return
+            try:
+                ops_str = get_setting(gid, 'operators') or '[]'
+                ops = json.loads(ops_str)
+                if target_id not in ops:
+                    ops.append(target_id)
+                    update_setting(gid, 'operators', json.dumps(ops))
+                bot.reply_to(message, f"✅ 已成功将 <b>{target_name}</b> 设为本群操作人！", parse_mode="HTML")
+            except Exception as e:
+                bot.reply_to(message, f"❌ 设置失败: {str(e)}")
+            return
+
+        # 3️⃣ 删最后 / 删今天 / 删全部功能
+        if text in ["删最后", "删今天", "删全部"]:
+            if not is_operator(gid, uid):
+                bot.reply_to(message, "⚠️ 无权操作！只有操作人可以删账。")
+                return
+            conn = get_db_connection()
+            c = conn.cursor()
+            if text == "删最后":
+                c.execute("SELECT id, remark, amount FROM bills WHERE group_id = ? ORDER BY id DESC LIMIT 1", (gid,))
+                last_row = c.fetchone()
+                if last_row:
+                    c.execute("DELETE FROM bills WHERE id = ?", (last_row[0],))
+                    bot.reply_to(message, f"🗑️ 已成功撤销最后一笔账目: 【{last_row[1] or '无备注'}: {last_row[2]}】")
+                else:
+                    bot.reply_to(message, "📭 当前没有任何账单记录。")
+            elif text == "删今天":
+                c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today_str))
+                bot.reply_to(message, f"🗑️ 已清空今日 ({today_str}) 的所有账单数据！")
+            elif text == "删全部":
+                c.execute("DELETE FROM bills WHERE group_id = ?", (gid,))
+                bot.reply_to(message, "🗑️ 已清空本群历史所有的账单数据！")
+            conn.commit()
+            conn.close()
+            send_text_bill_report(gid, gid, today_str)
+            return
+
+        # 4️⃣ 清单 + 备注 过滤查询功能
+        if text.startswith("清单"):
+            target_remark = text.replace("清单", "").strip()
+            if not target_remark:
+                bot.reply_to(message, "💡 请指定具体备注名，例如: `清单 飞机群公款`")
+                return
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT timestamp, amount, usdt_amount, exchange_rate FROM bills WHERE group_id = ? AND date_str = ? AND remark = ? AND bill_type='income'", (gid, today_str, target_remark))
+            rows = c.fetchall()
+            conn.close()
+            if not rows:
+                bot.reply_to(message, f"🔍 今日暂无带有备注【{target_remark}】的进单记录。")
+            else:
+                q_report = f"📋 <b>【{target_remark}】专属进单明细：</b>\n\n"
+                total_r, total_u = 0, 0
+                for r in rows:
+                    time_s = r[0][11:16]
+                    q_report += f"  🔹 {time_s} | 进 <b>{r[1]:.0f}</b> RMB -> 折合 <b>{r[2]:.1f}</b> U (汇率:{r[3]:.2f})\n"
+                    total_r += r[1]
+                    total_u += r[2]
+                q_report += f"\n📈 <b>小计汇总：</b>\n总入款: {total_r:.0f} RMB\n总折合: {total_u:.1f} USDT"
+                bot.reply_to(message, q_report, parse_mode="HTML")
+            return
+
+        # 基础上下课控制
         if text == '上课':
             update_setting(gid, 'is_active', 1)
-            bot.reply_to(message, "🟢 记账安全通道已开启！可以开始录入账单。")
+            bot.reply_to(message, "🟢 记账安全通道已开启！")
             return
         if text == '下课':
             update_setting(gid, 'is_active', 0)
@@ -392,19 +452,20 @@ def handle_all_messages(message):
             send_text_bill_report(gid, gid, today_str)
             return
 
-        if (get_setting(gid, 'is_active') or 0) == 0: 
-            return
+        if (get_setting(gid, 'is_active') or 0) == 0: return
 
         if text == '+0':
             send_text_bill_report(gid, gid, today_str)
             return
 
+        # 支持 备注+下发 (例如: 额外费用下发500)
         m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
         if m_exp:
             add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
             send_text_bill_report(gid, gid, today_str)
             return
 
+        # 支持 备注+入款（带备注或不带均可，例如: 项目公款+5000 或者 +1000/7.3）
         m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
         if m_inc:
             rem = m_inc.group(1).strip()
