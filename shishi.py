@@ -13,7 +13,7 @@ import requests
 # ==================== 1. 系统核心配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAGo2jpAKZ2YuWf7ONNMBI13fGuI9NSheSM')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAE8D_GcatHeustkKVqGCtnyc9BVA5Xc2-k')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-668gg.onrender.com')
 PORT = int(os.environ.get('PORT', 5000))
 
@@ -24,7 +24,7 @@ TRON_ADDRESS = "TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw"
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 flask_app = Flask(__name__)
 
-# 内存中暂存私聊操作状态： { user_id: "WAITING_ADD_VIP" 或 "WAITING_DEL_VIP" }
+# 内存中暂存私聊操作状态
 USER_STATE = {}
 
 # ==================== 2. 🌐 强力波场链上数据抓取引擎 ====================
@@ -96,9 +96,8 @@ def init_db():
                   timezone TEXT DEFAULT 'Asia/Shanghai', show_usdt INTEGER DEFAULT 1, expire_time TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS bills
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, user_id INTEGER, username TEXT,
-                  remark TEXT, amount REAL, usdt_amount REAL, exchange_rate REAL, bill_type TEXT,
+                  remark TEXT, amount REAL, usdt_amount REAL, exchange_rate REAL Seine_type TEXT,
                   timestamp TEXT, date_str TEXT, is_settled INTEGER DEFAULT 0)''')
-    # level 字段：1 代表最高级买家(大老板)，2 代表权限人(二级VIP)
     c.execute('''CREATE TABLE IF NOT EXISTS vip_users
                  (user_id INTEGER PRIMARY KEY, username TEXT, expire_time TEXT, level INTEGER DEFAULT 2)''')
     conn.commit()
@@ -114,12 +113,7 @@ def get_current_time(timezone_str='Asia/Shanghai'):
         now = datetime.now(tz)
         return now, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-# 检查权限状态
 def get_user_permission_level(user_id):
-    """
-    返回: (是否有权, 级别描述, 到期时间, 整数级别)
-    级别说明: 1=顶级买家(大老板), 2=权限人(二级VIP), 0=无权限
-    """
     if user_id in FOUNDER_USERS:
         return True, "最高级买家 (系统创始人)", "永久终身授权", 1
         
@@ -143,6 +137,24 @@ def get_user_permission_level(user_id):
 def add_vip_user(user_id, username, months=12, level=2):
     conn = get_db_connection()
     c = conn.cursor()
+    
+    # ⭐【核心修改】：限制二级权限人(level=2)总数最高为 5 人
+    if level == 2:
+        c.execute("SELECT user_id, expire_time FROM vip_users WHERE level = 2")
+        all_vips = c.fetchall()
+        active_vip2_count = 0
+        now_time = datetime.now()
+        for v_id, exp_str in all_vips:
+            if v_id == user_id: 
+                continue # 如果是给已有的二级VIP续费，不占用新名额
+            try:
+                if datetime.strptime(exp_str, "%Y-%m-%d %H:%M:%S") > now_time:
+                    active_vip2_count += 1
+            except: pass
+        if active_vip2_count >= 5:
+            conn.close()
+            raise ValueError("LIMIT_EXCEEDED") # 触发数量封顶异常
+
     c.execute("SELECT expire_time FROM vip_users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     
@@ -165,7 +177,6 @@ def add_vip_user(user_id, username, months=12, level=2):
     return expire_str
 
 def get_all_level2_vips():
-    """获取所有二级权限人的UID和用户名清单"""
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -214,16 +225,29 @@ def update_setting(group_id, key, value):
         conn.close()
     except: pass
 
-def is_operator(group_id, user_id):
-    # 如果是买家或者二级权限人，默认在所有群组中拥有最高管辖操作权
+def is_operator(group_id, user_id, username_mention=""):
+    """
+    精确权鉴网关：
+    1. 创始人及系统有效买家/二级VIP在任何群均返回 True。
+    2. 如果传入了用户名或UID，且该名称命中当前群组 settings 表中的 operators 列表，则返回 True。
+    """
+    # 创始人或全局大老板/二级权限人
     has_auth, _, _, _ = get_user_permission_level(user_id)
-    if has_auth: return True
+    if has_auth: 
+        return True
     
+    # 检查当前群指派的本地打工仔操作人
     ops_str = get_setting(group_id, 'operators') or '[]'
     try:
         ops = json.loads(ops_str)
-        return user_id in ops
-    except: return False
+        # 支持 UID 数字验证、纯字符串验证或带@前缀验证
+        if user_id in ops or str(user_id) in ops:
+            return True
+        if username_mention and (username_mention in ops or username_mention.replace("@", "") in ops):
+            return True
+        return False
+    except: 
+        return False
 
 # ==================== 4. 📊 记账数据业务层 ====================
 def add_bill(group_id, user_id, username, remark, amount, bill_type, exchange_rate=None):
@@ -289,6 +313,19 @@ def send_text_bill_report(chat_id, gid, target_date):
     bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=markup)
 
 # ==================== 5. 💬 Telegram 核心控制指令扩展网关 ====================
+
+# ⭐【核心修改】：首次被拉入群组时，自动触发打招呼信息
+@bot.message_handler(content_types=['new_chat_members'])
+def handle_bot_joined_group(message):
+    for member in message.new_chat_members:
+        if member.id == bot.get_me().id:
+            welcome_text = (
+                "感谢您把我添加到贵群!\n"
+                "下一步为我可以开始记账，请发：上课"
+            )
+            bot.send_message(message.chat.id, welcome_text)
+            break
+
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     gid = message.chat.id
@@ -297,7 +334,6 @@ def cmd_start(message):
     if message.chat.type == "private":
         has_auth, lvl_desc, _, lvl = get_user_permission_level(uid)
         
-        # 组装 6 按钮专属核心交互键盘
         markup = telebot.types.InlineKeyboardMarkup(row_width=2)
         btn1 = telebot.types.InlineKeyboardButton("📅 查看到期时间", callback_data="btn_check_expire")
         btn2 = telebot.types.InlineKeyboardButton("📖 详细说明书", callback_data="btn_manual_guide")
@@ -306,7 +342,6 @@ def cmd_start(message):
         markup.add(btn1, btn2)
         markup.add(btn3)
         
-        # ⭐【核心风控逻辑】：只有最高级别买家（或系统创始人级）才能看设置/移除二级VIP的菜单按钮
         if uid in FOUNDER_USERS or (has_auth and lvl == 1):
             btn4 = telebot.types.InlineKeyboardButton("🔑 设置权限人", callback_data="btn_grant_vip2")
             btn5 = telebot.types.InlineKeyboardButton("❌ 取掉权限人", callback_data="btn_revoke_vip2")
@@ -334,28 +369,25 @@ def cmd_start(message):
         )
         bot.send_message(gid, welcome, parse_mode="HTML")
 
-# 处理私发中的独立控制面板 6 按钮点击事件
 @bot.callback_query_handler(func=lambda call: call.data.startswith('btn_'))
 def handle_private_buttons(call):
     uid = call.from_user.id
     has_auth, lvl_desc, expire_time, lvl = get_user_permission_level(uid)
     chat_id = call.message.chat.id
     
-    # 1. 查看到期时间
     if call.data == "btn_check_expire":
         status_text = "🟢 正常生效中" if has_auth else "🔴 资质已过期/未激活"
         reply = f"👤 <b>您的身份体系：</b>\n• 级别：<code>{lvl_desc}</code>\n• 状态：{status_text}\n• 有效截止期：<code>{expire_time}</code>"
         bot.send_message(chat_id, reply, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         
-    # 2. 详细说明书
     elif call.data == "btn_manual_guide":
         manual = (
             "📖 <b>【小跟班记账】全功能业务操作指南</b>\n\n"
             "👑 <b>权限架构：</b>\n"
             "1. <b>最高级买家</b>：控制全局，在私聊有 6 键菜单，可指派二级权限人。\n"
             "2. <b>权限人(二级VIP)</b>：协助买家管事，在私聊无法配置老板，但可以被拉进各个群指派群操作人。\n"
-            "3. <b>操作人(打工仔)</b>：由前两者在群组里通过指令指定，专职打工记账。\n\n"
+            "3. <b>操作人(打工仔)</b>：由前两者在群组里通过指令指定，专职单群打工记账。\n\n"
             "👥 <b>群内指令集：</b>\n"
             "• <code>设置操作人 @用户名</code>（限买家/权限人）\n"
             "• <code>取掉操作人 @用户名</code>（限买家/权限人）\n"
@@ -367,7 +399,6 @@ def handle_private_buttons(call):
         bot.send_message(chat_id, manual, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         
-    # 3. 自助续费
     elif call.data == "btn_pay_usdt":
         reply = (
             f"💰 <b>USDT 授权价格套餐：</b>\n"
@@ -379,7 +410,6 @@ def handle_private_buttons(call):
         bot.send_message(chat_id, reply, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         
-    # 4. 设置权限人（核心拦截：只有最高买家/创始人能点）
     elif call.data == "btn_grant_vip2":
         if uid not in FOUNDER_USERS and lvl != 1:
             bot.answer_callback_query(call.id, "⚠️ 极高权限风控！只有最高级买家才能指派二级权限人。", show_alert=True)
@@ -388,7 +418,6 @@ def handle_private_buttons(call):
         bot.send_message(chat_id, "➡️ <b>请在下方直接输入您想要授权的【二级权限人】的 UID (纯数字)：</b>\n机器人收到后会将其绑定为您的分管帮手。", parse_mode="HTML")
         bot.answer_callback_query(call.id)
         
-    # 5. 取掉权限人（精准回显名录）
     elif call.data == "btn_revoke_vip2":
         if uid not in FOUNDER_USERS and lvl != 1:
             bot.answer_callback_query(call.id, "⚠️ 极高权限风控！只有最高级买家才能撤销二级权限人。", show_alert=True)
@@ -409,7 +438,6 @@ def handle_private_buttons(call):
         bot.send_message(chat_id, list_text, parse_mode="HTML")
         bot.answer_callback_query(call.id)
 
-# 创始人处理买家发来的打款截图
 @bot.message_handler(content_types=['photo'])
 def handle_receipt_photo(message):
     if message.chat.type != "private": return 
@@ -449,13 +477,18 @@ def handle_auth_buttons(call):
         months = int(action)
         buyer_id = int(data_parts[2])
         buyer_name = data_parts[3]
-        # level=1 代表升级为最高级买家大老板
-        expire_str = add_vip_user(buyer_id, buyer_name, months, level=1)
+        
+        # ⭐ 处理可能由于二级VIP数量满5人引发的逻辑拦截
         try:
-            bot.send_message(buyer_id, f"🎉 <b>最高级买家特权已开通！有效时间延长 {months} 个月。</b>\n您现在拥有 6 键完整后台菜单，可授权二级权限人并指派群组操作人！", parse_mode="HTML")
-        except: pass
-        bot.edit_message_caption(f"✅ 审核成功！买家到期时间: {expire_str}", chat_id=call.message.chat.id, message_id=call.message.message_id)
-    bot.answer_callback_query(call.id, "操作成功！")
+            expire_str = add_vip_user(buyer_id, buyer_name, months, level=1)
+            try:
+                bot.send_message(buyer_id, f"🎉 <b>最高级买家特权已开通！有效时间延长 {months} 个月。</b>\n您现在拥有 6 键完整后台菜单，可授权二级权限人并指派群组操作人！", parse_mode="HTML")
+            except: pass
+            bot.edit_message_caption(f"✅ 审核成功！买家到期时间: {expire_str}", chat_id=call.message.chat.id, message_id=call.message.message_id)
+        except ValueError as e:
+            if str(e) == "LIMIT_EXCEEDED":
+                bot.answer_callback_query(call.id, "⚠️ 开通失败！系统当前活跃的二级权限人名额已满5人封顶！", show_alert=True)
+        bot.answer_callback_query(call.id, "操作成功！")
 
 @bot.message_handler(func=lambda m: True)
 def handle_all_messages(message):
@@ -463,12 +496,13 @@ def handle_all_messages(message):
     gid = message.chat.id
     uid = message.from_user.id
     username = message.from_user.first_name or "用户"
+    user_mention = f"@{message.from_user.username}" if message.from_user.username else ""
 
     # ==================== 💎 私聊精确控制抓取区 ====================
     if message.chat.type == "private":
         if uid in USER_STATE and (USER_STATE[uid] in ["WAITING_ADD_VIP2", "WAITING_DEL_VIP2"]):
             current_action = USER_STATE[uid]
-            del USER_STATE[uid] # 释放状态锁
+            del USER_STATE[uid]
             
             if not text.isdigit():
                 bot.reply_to(message, "❌ <b>设置失败！</b> 您输入的 UID 包含非数字字符。请重新点击菜单按纽并精确发送纯数字 UID。", parse_mode="HTML")
@@ -477,11 +511,14 @@ def handle_all_messages(message):
             target_uid = int(text)
             
             if current_action == "WAITING_ADD_VIP2":
-                # 设置为二级 VIP (level=2)
-                expire_str = add_vip_user(target_uid, "通过买家私聊转授", months=12, level=2)
-                bot.reply_to(message, f"✅ <b>授权成功！</b>\n目标用户 <code>{target_uid}</code> 已成为您的<b>【二级权限人助手】</b>。\n授权到期日同设为：{expire_str}\n该助手现在可以把机器人拉进他的业务群并帮您配置群记账员了！", parse_mode="HTML")
-                try: bot.send_message(target_uid, "🎉 <b>通知：您已被最高级买家老板提升为机器人的【二级权限人(VIP2)】！</b>\n现在您可以将机器人拉入您的业务群并使用群管指令了。", parse_mode="HTML")
-                except: pass
+                try:
+                    expire_str = add_vip_user(target_uid, "通过买家私聊转授", months=12, level=2)
+                    bot.reply_to(message, f"✅ <b>授权成功！</b>\n目标用户 <code>{target_uid}</code> 已成为您的<b>【二级权限人助手】</b>。\n授权到期日同设为：{expire_str}\n该助手现在可以把机器人拉进他的业务群并帮您配置群记账员了！", parse_mode="HTML")
+                    try: bot.send_message(target_uid, "🎉 <b>通知：您已被最高级买家老板提升为机器人的【二级权限人(VIP2)】！</b>\n现在您可以将机器人拉入您的业务群并使用群管指令了。", parse_mode="HTML")
+                    except: pass
+                except ValueError as e:
+                    if str(e) == "LIMIT_EXCEEDED":
+                        bot.reply_to(message, "❌ <b>授权失败！系统最高安全风控拦截：</b>\n当前系统分配出的活跃【二级权限人(VIP2)】数量已达 <b>5人最高封顶线</b>。请先删减没用的助手名额再来增加。", parse_mode="HTML")
             else:
                 if remove_vip_user(target_uid):
                     bot.reply_to(message, f"🗑️ <b>权限已彻底撤销！</b>\n用户 <code>{target_uid}</code> 的二级权限人资格已被移除收回。", parse_mode="HTML")
@@ -513,14 +550,14 @@ def handle_all_messages(message):
                     bot.reply_to(message, f"❌ 检索失败: {chain_res['msg']}")
                 return
 
-    # ==================== 👥 群组专区 (二级及以上VIP皆可在群内任意发号施令) ====================
+    # ==================== 👥 群组专区 ====================
     if message.chat.type in ["group", "supergroup"]:
         now, _, _ = get_current_time()
         today_str = now.strftime("%Y-%m-%d")
 
         # 1️⃣ 设置汇率功能
         if text.startswith("设置汇率"):
-            if not is_operator(gid, uid):
+            if not is_operator(gid, uid, user_mention):
                 bot.reply_to(message, "⚠️ 只有群操作人、二级权限人或买家老板才能修改汇率。")
                 return
             try:
@@ -531,7 +568,7 @@ def handle_all_messages(message):
                 bot.reply_to(message, "❌ 格式错误！请输入如: `设置汇率 7.3`")
             return
 
-        # 2️⃣ 👑 设置操作人 (买家老板/二级权限人均可在群里任免打工仔)
+        # 2️⃣ 设置操作人
         if text.startswith("设置操作人"):
             has_auth, _, _, _ = get_user_permission_level(uid)
             if uid not in FOUNDER_USERS and not has_auth:
@@ -562,7 +599,7 @@ def handle_all_messages(message):
                 bot.reply_to(message, "💡 <b>使用指南：</b>\n群里发送： <code>设置操作人 @用户名</code>")
             return
 
-        # 3️⃣ 👑 取掉操作人
+        # 3️⃣ 取掉操作人
         if text.startswith("取掉操作人") or text.startswith("取消操作人"):
             has_auth, _, _, _ = get_user_permission_level(uid)
             if uid not in FOUNDER_USERS and not has_auth:
@@ -605,8 +642,7 @@ def handle_all_messages(message):
 
         # 4️⃣ 撤账控制
         if text in ["删最后", "删今天", "删全部"]:
-            user_mention = f"@{message.from_user.username}" if message.from_user.username else ""
-            if not is_operator(gid, uid) and not (user_mention and is_operator(gid, user_mention)):
+            if not is_operator(gid, uid, user_mention):
                 bot.reply_to(message, "⚠️ 无权操作！只有群操作人、二级权限人或买家老板可以删账。")
                 return
             conn = get_db_connection()
@@ -657,12 +693,15 @@ def handle_all_messages(message):
 
         # 基础控制
         if text == '上课':
-            if not is_operator(gid, uid): return
+            # ⭐【核心修改】：操作人拥有本地单群上课特权
+            if not is_operator(gid, uid, user_mention): return
             update_setting(gid, 'is_active', 1)
             bot.reply_to(message, "🟢 记账安全通道已开启！")
             return
+            
         if text == '下课':
-            if not is_operator(gid, uid): return
+            # ⭐【核心修改】：操作人拥有本地单群下课特权
+            if not is_operator(gid, uid, user_mention): return
             update_setting(gid, 'is_active', 0)
             bot.reply_to(message, "🔴 下课成功！今日账单已自动封存锁定。")
             send_text_bill_report(gid, gid, today_str)
@@ -671,13 +710,13 @@ def handle_all_messages(message):
         if (get_setting(gid, 'is_active') or 0) == 0: return
 
         if text == '+0':
-            if not is_operator(gid, uid): return
+            # ⭐【核心修改】：完美解除对操作人的屏蔽，让单群操作人也可随心刷出 +0 大底
+            if not is_operator(gid, uid, user_mention): return
             send_text_bill_report(gid, gid, today_str)
             return
 
         # 流水记账过滤
-        user_mention = f"@{message.from_user.username}" if message.from_user.username else ""
-        if is_operator(gid, uid) or (user_mention and is_operator(gid, user_mention)):
+        if is_operator(gid, uid, user_mention):
             m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
             if m_exp:
                 add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
