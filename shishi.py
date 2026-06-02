@@ -13,8 +13,8 @@ import requests
 # ==================== 1. 系统核心配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAGIqPHNpxXJD1ngnVxyYhbL2v7R5C13_pM')
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-668gg.onrender.com')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAH0HYPKbLaG7Nvjck5V4eS9Qm38dHjMy2g')
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-888gg.onrender.com')
 PORT = int(os.environ.get('PORT', 5000))
 
 # 顶级系统创始人UID（拥有最高买家资格，且负责审核续费凭证）
