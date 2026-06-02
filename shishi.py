@@ -13,56 +13,53 @@ import requests
 # ==================== 1. 系统核心配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8617895746:AAHUyKA5aVC18VFXt5l9IWdhLs4oxNlvNaU')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8617895746:AAEWyLcn-gr5nxQxTkAL8S4ybZApabm9ouc')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-668gg.onrender.com')
 PORT = int(os.environ.get('PORT', 5000))
 
-FOUNDER_USERS = [8179896441]
+FOUNDER_USERS = [8179896441]  # 顶级系统创始人
 TRON_ADDRESS = "TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw"
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 flask_app = Flask(__name__)
 
-# ==================== 2. 🌐 波场链上数据抓取引擎 ====================
+# ==================== 2. 🌐 强力波场链上数据抓取引擎 ====================
 def fetch_blockchain_usdt_info(address):
     USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
     try:
-        # 修正后的 Tronscan 账户 Token 查询接口
-        account_url = f"https://apilist.tronscanapi.com/api/account/tokens?address={address}"
-        response = requests.get(account_url, headers=headers, timeout=10)
+        rpc_url = "https://api.trongrid.io/v1/accounts/" + address
+        response = requests.get(rpc_url, headers=headers, timeout=10)
         usdt_balance = 0.0
         
         if response.status_code == 200:
             data = response.json()
-            # 兼容处理返回的 token 列表结构
-            token_list = data.get('data', data.get('tokens', []))
-            for token in token_list:
-                if token.get('tokenId') == USDT_CONTRACT or token.get('token_id') == USDT_CONTRACT:
-                    raw_amount = token.get('balance', token.get('amount', 0))
-                    usdt_balance = float(raw_amount) / 1000000.0
-                    break
-        else:
-            return {"success": False, "msg": f"Tronscan 节点异常 ({response.status_code})"}
+            if data.get('success') and data.get('data'):
+                trc20_list = data['data'][0].get('trc20', [])
+                for item in trc20_list:
+                    if USDT_CONTRACT in item:
+                        usdt_balance = float(item[USDT_CONTRACT]) / 1000000.0
+                        break
         
-        # 获取转账流水的接口保持健壮性
-        tx_url = f"https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=5&start=0&sort=-timestamp&contract_address={USDT_CONTRACT}&relatedAddress={address}"
+        tx_url = f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20?limit=5&contract_address={USDT_CONTRACT}"
         history_text = ""
         try:
             tx_response = requests.get(tx_url, headers=headers, timeout=10)
             if tx_response.status_code == 200:
                 tx_data = tx_response.json()
-                tx_list = tx_data.get('token_transfers', tx_data.get('data', []))
+                tx_list = tx_data.get('data', [])
                 if not tx_list:
                     history_text = "  暂无最近的 USDT 转账流水。"
                 else:
                     for tx in tx_list:
-                        from_addr = tx.get('from_address', '')
-                        to_addr = tx.get('to_address', '')
-                        amount = float(tx.get('quant', tx.get('amount', 0))) / 1000000
+                        from_addr = tx.get('from', '')
+                        to_addr = tx.get('to', '')
+                        raw_val = tx.get('value', tx.get('amount', '0'))
+                        amount = float(raw_val) / 1000000.0 if raw_val else 0.0
+                        
                         if from_addr.lower() == address.lower():
                             direction = "🔴 支出"
                             peer_info = f"去往: {to_addr[:6]}***{to_addr[-6:]}"
@@ -71,7 +68,7 @@ def fetch_blockchain_usdt_info(address):
                             peer_info = f"来自: {from_addr[:6]}***{from_addr[-6:]}"
                         history_text += f"  {direction} | <b>{amount:.2f} U</b>\n  └ <i>{peer_info}</i>\n"
             else:
-                history_text = "  ⚠️ 暂时无法获取流水明细（频率受限）。"
+                history_text = "  ⚠️ 暂时无法获取流水明细（公共通道高频受限）。"
         except:
             history_text = "  ⚠️ 链上网络拥堵，流水加载失败。"
 
@@ -184,6 +181,10 @@ def update_setting(group_id, key, value):
 
 def is_operator(group_id, user_id):
     if user_id in FOUNDER_USERS: return True
+    # 只要是买家（拥有VIP权限的老板），默认具备本群最高操作权
+    is_vip, _ = get_vip_expire_time(user_id)
+    if is_vip: return True
+    
     ops_str = get_setting(group_id, 'operators') or '[]'
     try:
         ops = json.loads(ops_str)
@@ -238,7 +239,7 @@ def send_text_bill_report(chat_id, gid, target_date):
         for row in income[-5:]:
             remark, username, amount, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
-            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U" + (f" ({remark})\n" if remark else "\n")
+            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U" + (f" ({remark}) [由 {username}]\n" if remark else f" [由 {username}]\n")
     else:
         report += "  暂无入款数据\n"
     if expense:
@@ -246,7 +247,7 @@ def send_text_bill_report(chat_id, gid, target_date):
         for row in expense[-5:]:
             remark, username, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
-            report += f"  {time_str} 下发 {usdt_amount:.1f}U" + (f" ({remark})\n" if remark else "\n")
+            report += f"  {time_str} 下发 {usdt_amount:.1f}U" + (f" ({remark}) [由 {username}]\n" if remark else f" [由 {username}]\n")
 
     report += f"\n💰 <b>汇率:</b> {rate:.2f}\n📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n📊 <b>已下发:</b> {expense_usdt:.1f}U\n📊 <b>未下发:</b> {remaining_usdt:.1f}U\n\n<code>[核算编号: {random.randint(1000,9999)}]</code>"
     markup = telebot.types.InlineKeyboardMarkup()
@@ -265,13 +266,12 @@ def cmd_start(message):
         "• 发送 <code>项目公款+5000</code> 记带备注账目\n"
         "• 发送 <code>下发500</code> 记下发\n"
         "• 发送 <code>+0</code> 查看对账大底\n\n"
-        "⚙️ <b>高阶财务群管命令（仅限操作人）：</b>\n"
+        "⚙️ <b>财务群管命令（买家老板/操作人）：</b>\n"
         "• <code>设置汇率 7.35</code> - 一键调整当前汇率\n"
-        "• <code>设置操作人 @username</code> - 授权他人共同记账管理\n"
-        "• <code>清单 备注名</code> - 过滤查询指定备注名下的所有进单明细\n"
-        "• <code>删最后</code> - 撤销最后一笔错误记账\n"
-        "• <code>删今天</code> - 清空今天的所有账单记录\n"
-        "• <code>删全部</code> - 清空本群历史所有未清算数据"
+        "• <code>设置操作人 @用户名</code> - 授权他人共同记账（限买家/老板）\n"
+        "• <code>取掉操作人 @用户名</code> - 取消某人的群记账权（限买家/老板）\n"
+        "• <code>清单 备注名</code> - 过滤查询指定备注名下的明细\n"
+        "• <code>删最后</code> / <code>删今天</code> - 账目撤销"
     )
     bot.send_message(gid, welcome, parse_mode="HTML")
 
@@ -285,17 +285,18 @@ def handle_receipt_photo(message):
     
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
-        telebot.types.InlineKeyboardButton("✅ 批准 1个月", callback_data=f"auth_1_{uid}_{username}"),
-        telebot.types.InlineKeyboardButton("✅ 批准 3个月", callback_data=f"auth_3_{uid}_{username}")
+        telebot.types.InlineKeyboardButton("✅ 1个月", callback_data=f"auth_1_{uid}_{username}"),
+        telebot.types.InlineKeyboardButton("✅ 2个月", callback_data=f"auth_2_{uid}_{username}"),
+        telebot.types.InlineKeyboardButton("✅ 3个月", callback_data=f"auth_3_{uid}_{username}")
     )
     markup.add(telebot.types.InlineKeyboardButton("❌ 驳回凭证", callback_data=f"auth_reject_{uid}"))
     
     for founder in FOUNDER_USERS:
         try:
-            bot.send_message(founder, f"🔔 <b>收到新的自助续费申请！</b>\n\n👤 买家: {first_name} (@{username})\n🆔 UID: <code>{uid}</code>", parse_mode="HTML")
+            bot.send_message(founder, f"🔔 <b>收到新的私聊续费申请（申请权限人）！</b>\n\n👤 申请人: {first_name} (@{username})\n🆔 UID: <code>{uid}</code>", parse_mode="HTML")
             bot.send_photo(founder, photo_id, reply_markup=markup)
         except: pass
-    bot.reply_to(message, "⏳ <b>凭证已成功提交！</b> 系统正在核验，请耐心等待 1-3 分钟。")
+    bot.reply_to(message, "⏳ <b>凭证已提交给后台！</b> 系统正在核验，请耐心等待 1-3 分钟。")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('auth_'))
 def handle_auth_buttons(call):
@@ -316,7 +317,7 @@ def handle_auth_buttons(call):
         buyer_name = data_parts[3]
         expire_str = add_vip_months(buyer_id, buyer_name, months)
         try:
-            bot.send_message(buyer_id, f"🎉 <b>您的自助续费申请已通过审核！开通 {months} 个月 VIP 授权。</b>", parse_mode="HTML")
+            bot.send_message(buyer_id, f"🎉 <b>权限人(VIP)资格已开通！有效时间延长 {months} 个月。</b>\n您现在可以在绑定的群内使用最高权限管理并指定【操作人】了。", parse_mode="HTML")
         except: pass
         bot.edit_message_caption(f"✅ 审核成功！到期时间: {expire_str}", chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.answer_callback_query(call.id, "操作成功！")
@@ -328,29 +329,29 @@ def handle_all_messages(message):
     uid = message.from_user.id
     username = message.from_user.first_name or "用户"
 
-    # 问题 2：自助续费文案补充价格体系
-    if text == "自助续费":
-        reply = (
-            f"💎 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code>\n\n"
-            f"💰 <b>授权价格套餐：</b>\n"
-            f"• 1 个月：<b>80</b> RMB / U\n"
-            f"• 2 个月：<b>140</b> RMB / U\n"
-            f"• 3 个月：<b>230</b> RMB / U\n\n"
-            f"⚠️ 转账后直接把【交易成功截图】发送给机器人即可完成自动申请核验。"
-        )
-        bot.reply_to(message, reply, parse_mode="HTML")
-        return
+    # ==================== 私聊专区 (权限人自助申请) ====================
+    if message.chat.type == "private":
+        if text == "自助续费":
+            reply = (
+                f"💎 <b>官方波场(TRC20)收款地址：</b>\n<code>{TRON_ADDRESS}</code>\n\n"
+                f"💰 <b>USDT 授权价格套餐：</b>\n"
+                f"• 1 个月：<b>80</b> USDT\n"
+                f"• 2 个月：<b>140</b> USDT\n"
+                f"• 3 个月：<b>230</b> USDT\n\n"
+                f"⚠️ 转账后直接把【交易成功截图】发给机器人，创始人审核通过后您即可成为【权限人】。"
+            )
+            bot.reply_to(message, reply, parse_mode="HTML")
+            return
 
-    if text == "详细说明书":
-        bot.reply_to(message, "📖 请发送 /help 查看完整的功能命令帮助指南。")
-        return
+        if text == "详细说明书":
+            bot.reply_to(message, "📖 请发送 /help 查看完整的功能命令帮助指南。")
+            return
 
-    # 问题 3：到期时间加入精确时间展示
-    if text == "到期时间":
-        is_active, expire_time = get_vip_expire_time(uid)
-        status = "🟢 VIP 激活中" if is_active else "🔴 已到期/未激活"
-        bot.reply_to(message, f"👤 <b>权限状态</b>: {status}\n📅 <b>到期时间</b>: <code>{expire_time}</code>", parse_mode="HTML")
-        return
+        if text == "到期时间":
+            is_active, expire_time = get_vip_expire_time(uid)
+            status = "🟢 权限人资格生效中" if is_active else "🔴 已到期/未激活"
+            bot.reply_to(message, f"👤 <b>权限状态</b>: {status}\n📅 <b>到期时间</b>: <code>{expire_time}</code>", parse_mode="HTML")
+            return
 
     # 🔍 链上实时查询
     if text.startswith("查看"):
@@ -358,7 +359,7 @@ def handle_all_messages(message):
         if len(parts) >= 2:
             target_address = parts[1].strip()
             if target_address.startswith("T") and len(target_address) == 34:
-                wait_msg = bot.reply_to(message, "🔍 正在连接波场TRON全节点检索实时资产...")
+                wait_msg = bot.reply_to(message, "🔍 正在连接波场安全骨干全节点检索资产...")
                 chain_res = fetch_blockchain_usdt_info(target_address)
                 try: bot.delete_message(gid, wait_msg.message_id)
                 except: pass
@@ -369,17 +370,17 @@ def handle_all_messages(message):
                     bot.reply_to(message, f"❌ 检索失败: {chain_res['msg']}")
                 return
 
-    # =============== 以下功能仅限在群组内使用且需要授权 ===============
+    # ==================== 群组专区 (记账与委任操作人) ====================
     if message.chat.type in ["group", "supergroup"]:
-        is_active, _ = get_vip_expire_time(uid)
-        if not is_active: return 
+        # 验证该群是否有绑定的权限人处于激活状态（群组基础可用性保障）
+        # 此处简化为：只要发送指令的人或本群关联的老板有VIP即可。下面业务里精细校验。
         now, _, _ = get_current_time()
         today_str = now.strftime("%Y-%m-%d")
 
         # 1️⃣ 设置汇率功能
         if text.startswith("设置汇率"):
             if not is_operator(gid, uid):
-                bot.reply_to(message, "⚠️ 只有群操作人或老板才能修改汇率。")
+                bot.reply_to(message, "⚠️ 只有群操作人或买家老板才能修改汇率。")
                 return
             try:
                 new_rate = float(text.replace("设置汇率", "").strip())
@@ -389,32 +390,85 @@ def handle_all_messages(message):
                 bot.reply_to(message, "❌ 格式错误！请输入如: `设置汇率 7.3`")
             return
 
-        # 2️⃣ 设置操作人功能
+        # 2️⃣ 🌟 设置操作人 (仅限 买家/权限人 或 创始人 操控)
         if text.startswith("设置操作人"):
-            if uid not in FOUNDER_USERS:
-                bot.reply_to(message, "⚠️ 只有创始人(老板)才能委任群操作人。")
+            is_vip, _ = get_vip_expire_time(uid)
+            if uid not in FOUNDER_USERS and not is_vip:
+                bot.reply_to(message, "⚠️ 只有【买家/权限人老板】才有权力委任群内记账操作人。")
                 return
-            if message.reply_to_message:
-                target_id = message.reply_to_message.from_user.id
-                target_name = message.reply_to_message.from_user.first_name
+            
+            target_name = ""
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == 'mention':
+                        target_name = text[entity.offset:entity.offset + entity.length].strip()
+                        break
+            
+            if not target_name:
+                clean_text = text.replace("设置操作人", "").strip()
+                if clean_text: target_name = clean_text
+
+            if target_name:
+                try:
+                    ops_str = get_setting(gid, 'operators') or '[]'
+                    ops = json.loads(ops_str)
+                    if target_name not in ops:
+                        ops.append(target_name)
+                        update_setting(gid, 'operators', json.dumps(ops))
+                    bot.reply_to(message, f"✅ 成功！已将 <b>{target_name}</b> 设为本群操作人（该用户从此拥有群内记账与删账指令权）。", parse_mode="HTML")
+                except Exception as e:
+                    bot.reply_to(message, f"❌ 设置失败: {str(e)}")
             else:
-                bot.reply_to(message, "💡 请【回复】那个需要被设置为操作人的用户的消息，并发送 `设置操作人`")
-                return
-            try:
-                ops_str = get_setting(gid, 'operators') or '[]'
-                ops = json.loads(ops_str)
-                if target_id not in ops:
-                    ops.append(target_id)
-                    update_setting(gid, 'operators', json.dumps(ops))
-                bot.reply_to(message, f"✅ 已成功将 <b>{target_name}</b> 设为本群操作人！", parse_mode="HTML")
-            except Exception as e:
-                bot.reply_to(message, f"❌ 设置失败: {str(e)}")
+                bot.reply_to(message, "💡 <b>使用指南：</b>\n直接输入 <code>设置操作人 @用户名</code> 即可。")
             return
 
-        # 3️⃣ 删最后 / 删今天 / 删全部功能
+        # 3️⃣ 🌟 取掉操作人 (仅限 买家/权限人 或 创始人 操控)
+        if text.startswith("取掉操作人") or text.startswith("取消操作人"):
+            is_vip, _ = get_vip_expire_time(uid)
+            if uid not in FOUNDER_USERS and not is_vip:
+                bot.reply_to(message, "⚠️ 只有【买家/权限人老板】才有权力撤销群操作人。")
+                return
+                
+            target_name = ""
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == 'mention':
+                        target_name = text[entity.offset:entity.offset + entity.length].strip()
+                        break
+                        
+            if not target_name:
+                clean_text = text.replace("取掉操作人", "").replace("取消操作人", "").strip()
+                if clean_text: target_name = clean_text
+
+            if target_name:
+                try:
+                    ops_str = get_setting(gid, 'operators') or '[]'
+                    ops = json.loads(ops_str)
+                    
+                    removed = False
+                    if target_name in ops:
+                        ops.remove(target_name)
+                        removed = True
+                    elif target_name.replace("@", "") in ops:
+                        ops.remove(target_name.replace("@", ""))
+                        removed = True
+                        
+                    if removed:
+                        update_setting(gid, 'operators', json.dumps(ops))
+                        bot.reply_to(message, f"🗑️ 权限已撤销！<b>{target_name}</b> 不再是本群操作人。", parse_mode="HTML")
+                    else:
+                        bot.reply_to(message, f"ℹ️ 用户 <b>{target_name}</b> 本身就不是操作人。", parse_mode="HTML")
+                except Exception as e:
+                    bot.reply_to(message, f"❌ 移除失败: {str(e)}")
+            else:
+                bot.reply_to(message, "💡 <b>使用指南：</b>\n直接输入 <code>取掉操作人 @用户名</code> 即可。")
+            return
+
+        # 4️⃣ 撤账指令控制 (删最后 / 删今天 / 删全部)
         if text in ["删最后", "删今天", "删全部"]:
-            if not is_operator(gid, uid):
-                bot.reply_to(message, "⚠️ 无权操作！只有操作人可以删账。")
+            user_mention = f"@{message.from_user.username}" if message.from_user.username else ""
+            if not is_operator(gid, uid) and not (user_mention and is_operator(gid, user_mention)):
+                bot.reply_to(message, "⚠️ 无权操作！只有群操作人或买家老板可以删账。")
                 return
             conn = get_db_connection()
             c = conn.cursor()
@@ -437,7 +491,7 @@ def handle_all_messages(message):
             send_text_bill_report(gid, gid, today_str)
             return
 
-        # 4️⃣ 清单 + 备注 过滤查询功能
+        # 5️⃣ 清单分类过滤
         if text.startswith("清单"):
             target_remark = text.replace("清单", "").strip()
             if not target_remark:
@@ -445,7 +499,7 @@ def handle_all_messages(message):
                 return
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("SELECT timestamp, amount, usdt_amount, exchange_rate FROM bills WHERE group_id = ? AND date_str = ? AND remark = ? AND bill_type='income'", (gid, today_str, target_remark))
+            c.execute("SELECT timestamp, amount, usdt_amount, exchange_rate, username FROM bills WHERE group_id = ? AND date_str = ? AND remark = ? AND bill_type='income'", (gid, today_str, target_remark))
             rows = c.fetchall()
             conn.close()
             if not rows:
@@ -455,7 +509,7 @@ def handle_all_messages(message):
                 total_r, total_u = 0, 0
                 for r in rows:
                     time_s = r[0][11:16]
-                    q_report += f"  🔹 {time_s} | 进 <b>{r[1]:.0f}</b> RMB -> 折合 <b>{r[2]:.1f}</b> U (汇率:{r[3]:.2f})\n"
+                    q_report += f"  🔹 {time_s} | 进 <b>{r[1]:.0f}</b> RMB -> 折合 <b>{r[2]:.1f}</b> U (由:{r[4]})\n"
                     total_r += r[1]
                     total_u += r[2]
                 q_report += f"\n📈 <b>小计汇总：</b>\n总入款: {total_r:.0f} RMB\n总折合: {total_u:.1f} USDT"
@@ -464,10 +518,12 @@ def handle_all_messages(message):
 
         # 基础上下课控制
         if text == '上课':
+            if not is_operator(gid, uid): return
             update_setting(gid, 'is_active', 1)
             bot.reply_to(message, "🟢 记账安全通道已开启！")
             return
         if text == '下课':
+            if not is_operator(gid, uid): return
             update_setting(gid, 'is_active', 0)
             bot.reply_to(message, "🔴 下课成功！今日账单已自动封存锁定。")
             send_text_bill_report(gid, gid, today_str)
@@ -476,28 +532,31 @@ def handle_all_messages(message):
         if (get_setting(gid, 'is_active') or 0) == 0: return
 
         if text == '+0':
+            if not is_operator(gid, uid): return
             send_text_bill_report(gid, gid, today_str)
             return
 
-        m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
-        if m_exp:
-            add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
-            send_text_bill_report(gid, gid, today_str)
-            return
+        # 流水记账过滤（仅限操作人和买家记账）
+        user_mention = f"@{message.from_user.username}" if message.from_user.username else ""
+        if is_operator(gid, uid) or (user_mention and is_operator(gid, user_mention)):
+            m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
+            if m_exp:
+                add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
+                send_text_bill_report(gid, gid, today_str)
+                return
 
-        m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
-        if m_inc:
-            rem = m_inc.group(1).strip()
-            sign = m_inc.group(2)
-            amt = float(m_inc.group(3))
-            if sign == '-': amt = -amt
-            c_rate = float(m_inc.group(4)) if m_inc.group(4) else None
-            add_bill(gid, uid, username, rem, amt, 'income', c_rate)
-            send_text_bill_report(gid, gid, today_str)
-            return
+            m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
+            if m_inc:
+                rem = m_inc.group(1).strip()
+                sign = m_inc.group(2)
+                amt = float(m_inc.group(3))
+                if sign == '-': amt = -amt
+                c_rate = float(m_inc.group(4)) if m_inc.group(4) else None
+                add_bill(gid, uid, username, rem, amt, 'income', c_rate)
+                send_text_bill_report(gid, gid, today_str)
+                return
 
 # ==================== 6. 🌐 Web 前端与 API 看板 ====================
-# 问题 4：已完全对换网页布局，使明细在上，总计卡片在底部
 @flask_app.route('/')
 def index():
     return '''<!DOCTYPE html>
@@ -532,7 +591,7 @@ def index():
 <body>
     <div class="container">
         <div class="header">
-            <h2>📊 分布式对账看板系统</h2>
+            <h2>📊 分布式对账看板 system</h2>
             <p id="group-text" style="font-size:12px; color:#64748b; margin-top:4px;">正在载入群组数据...</p>
             <div class="date-picker-area">
                 <label for="date-select">📅 账单转日查看：</label>
@@ -540,28 +599,24 @@ def index():
             </div>
         </div>
 
-        <!-- 1. 📥 进单明细 (移到最上方) -->
         <h3>📥 进单明细</h3>
         <table>
-            <thead><tr><th>时间</th><th>备注项目</th><th>金额(RMB)</th><th>折合(U)</th></tr></thead>
+            <thead><tr><th>时间</th><th>备注项目</th><th>金额(RMB)</th><th>折合(U)</th><th>操作人</th></tr></thead>
             <tbody id="income-list"></tbody>
         </table>
 
-        <!-- 2. 📤 下发记录明细 (移到第二) -->
         <h3 class="exp-title">📤 下发记录明细</h3>
         <table>
             <thead><tr><th>时间</th><th>下发备注</th><th>下发金额(USDT)</th><th>操作人</th></tr></thead>
             <tbody id="expense-list"></tbody>
         </table>
 
-        <!-- 3. 🗂️ 备注分类统计 (移到第三) -->
         <h3 class="cate-title">🗂️ 备注分类统计</h3>
         <table>
             <thead><tr><th>项目备注</th><th>总金额(RMB)</th><th>折合(USDT)</th><th>笔数</th></tr></thead>
             <tbody id="cate-list"></tbody>
         </table>
 
-        <!-- 4. 常规数据总计面板 (移到最下方) -->
         <div class="summary-grid">
             <div class="card"><div class="title">常规汇率</div><div class="value" id="rate">0.00</div></div>
             <div class="card"><div class="title">总入款 (RMB)</div><div class="value" id="total_rmb">0</div></div>
@@ -610,9 +665,9 @@ def index():
 
                 const incBody = document.getElementById('income-list');
                 if(data.income_bills && data.income_bills.length > 0) {
-                    incBody.innerHTML = data.income_bills.map(b => `<tr><td>${b.time}</td><td><b>${b.remark}</b></td><td>+${b.amount}</td><td style="color:#16a34a;font-weight:bold;">${b.usdt} U</td></tr>`).join('');
+                    incBody.innerHTML = data.income_bills.map(b => `<tr><td>${b.time}</td><td><b>${b.remark}</b></td><td>+${b.amount}</td><td style="color:#16a34a;font-weight:bold;">${b.usdt} U</td><td><span class="badge">${b.username}</span></td></tr>`).join('');
                 } else {
-                    incBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;">今日暂无入款明细</td></tr>';
+                    incBody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#94a3b8;">今日暂无入款明细</td></tr>';
                 }
                 
                 const expBody = document.getElementById('expense-list');
@@ -690,5 +745,5 @@ if __name__ == '__main__':
     init_db()
     bot.remove_webhook()
     bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-    print(f"🚀 全功能分布式看板系统已启动！")
+    print(f"🚀 看板系统服务已重载运行...")
     flask_app.run(host='0.0.0.0', port=PORT)
