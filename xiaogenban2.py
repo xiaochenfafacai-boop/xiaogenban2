@@ -233,53 +233,109 @@ def get_class_bills_by_date(group_id, target_date):
     return income, expense, total_income, total_expense
 
 # ==================== 统一账目文本渲染引擎 ====================
-async def send_text_bill_report(update, gid, target_date):
-    rate = get_setting(gid, 'exchange_rate') or 7.2
-    income, expense, total_income, total_expense = get_class_bills_by_date(gid, target_date)
+async def send_text_bill_report(update, group_id, date_str):
+    """
+    发送账单日报统计
+    保持昨天的完美格式与计算，仅将群内显示的入款和下发明细限制为最后加的 5 笔
+    """
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # 1. 调取当天所有账单（用于计算全局总和）
+    c.execute(
+        "SELECT id, username, remark, amount, bill_type, exchange_rate_snapshot, created_at "
+        "FROM bills WHERE group_id = ? AND date_str = ? ORDER BY id ASC",
+        (group_id, date_str)
+    )
+    all_rows = c.fetchall()
+    conn.close()
 
-    total_rmb = total_income[0] if (total_income and total_income[0]) else 0
-    total_usdt = total_income[1] if (total_income and total_income[1]) else 0
-    expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
+    # 获取当前群组的环境设定
+    rate = float(get_setting(group_id, 'exchange_rate') or 0.0)
+    fee = float(get_setting(group_id, 'fee_rate') or 0.0)
+
+    # 建立入款和下发的空列表
+    income_rows = []
+    expense_rows = []
+
+    total_rmb = 0.0
+    expense_usdt = 0.0
+
+    # 2. 遍历数据：全量统计总账，同时将账单归类
+    for row in all_rows:
+        b_type = row[4]
+        b_amt = row[3]
+        if b_type == 'income':
+            income_rows.append(row)
+            total_rmb += b_amt
+        elif b_type == 'expense':
+            expense_rows.append(row)
+            expense_usdt += b_amt
+
+    # 汇总账目计算
+    total_usdt = total_rmb / rate if rate > 0 else 0.0
     remaining_usdt = total_usdt - expense_usdt
 
-    report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
-    
-    report += "📥 <b>入款:</b>\n"
-    if income:
-        for row in income:
-            remark, username, amount, usdt_amount, ex_rate, timestamp = row
-            time_str = timestamp[11:16] if timestamp else "00:00"
-            rem_part = f" ({remark})" if remark else ""
-            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U{rem_part}\n"
+    # 3. 开始拼装完美的排版格式
+    report = f"📊 <b>今日账单汇总 {date_str}</b>\n"
+    report += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # 【📥 入款明细处理】：只在群里展示最后加的 5 笔
+    inc_count = len(income_rows)
+    report += f"📥 入款({inc_count} 笔):\n"
+    if not income_rows:
+        report += "  ㅤ 暂无入款数据\n"
     else:
-        report += "  暂无任何入款数据\n"
-
-    if expense:
-        report += "\n📤 <b>下发:</b>\n"
-        for row in expense:
-            remark, username, usdt_amount, ex_rate, timestamp = row
+        # ⭐ 核心改动：用切片 [-5:] 只取出最后加的 5 笔账单
+        for row in income_rows[-5:]:
+            timestamp = row[6]
             time_str = timestamp[11:16] if timestamp else "00:00"
-            rem_part = f" ({remark})" if remark else ""
-            report += f"  {time_str} 下发 {usdt_amount:.1f}U{rem_part}\n"
-
-    report += f"\n💰 <b>汇率:</b> {rate:.2f}\n"
-    report += f"📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n"
-    report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
-    report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
-
-    bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
-    if not bot_username:
-        try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
-        except: bot_username = "xiaogenban_bot"
+            b_amt = row[3]
+            b_rate = row[5] or rate
+            u_amt = b_amt / b_rate if b_rate > 0 else 0.0
+            rem_part = f" ({row[2]})" if row[2] else ""
+            
+            report += f"  ㅤ {time_str}  {b_amt:.0f} / {b_rate:.0f} = {u_amt:.2f} U{rem_part}\n"
         
-    keyboard = [
-        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
-    ]
-    
+        # 如果总笔数超过 5 笔，优雅打印省略提示
+        if inc_count > 5:
+            report += f"  ... 还有 {inc_count - 5} 笔\n"
+
+    report += "\n"
+
+    # 【📤 下发明细处理】：只在群里展示最后加的 5 笔
+    exp_count = len(expense_rows)
+    report += f"📤 下发({exp_count} 笔):\n"
+    if not expense_rows:
+        report += "  ㅤ 暂无下发数据\n"
+    else:
+        # ⭐ 核心改动：同样用切片 [-5:] 只取出最后加的 5 笔下发
+        for row in expense_rows[-5:]:
+            timestamp = row[6]
+            time_str = timestamp[11:16] if timestamp else "00:00"
+            b_amt = row[3]
+            rem_part = f" ({row[2]})" if row[2] else ""
+            
+            report += f"  ㅤ {time_str}  下发 {b_amt:.1f}U{rem_part}\n"
+            
+        if exp_count > 5:
+            report += f"  ... 还有 {exp_count - 5} 笔\n"
+
+    # 4. 拼装底部总账数据（保持昨天的完美格式）
+    report += f"\n💰 <b>汇率：</b>{rate:.2f}\n"
+    report += f"📊 <b>总入款：</b>{total_rmb:.0f} | {total_usdt:.2f} U\n"
+    report += f"📊 <b>已下发：</b>{expense_usdt:.2f} U\n"
+    report += f"📊 <b>未下发：</b>{remaining_usdt:.2f} U\n"
+
+    # 5. 生成动态对账 Web 网页跳转链接
+    web_url = f"{WEB_URL}?group_id={group_id}&date={date_str}"
+    report += f"（<a href='{web_url}'>查看完整账单（web）</a>）"
+
+    # 6. 发送群消息
     if update.message:
-        await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await update.message.reply_text(report, parse_mode="HTML", disable_web_page_preview=True)
     elif update.callback_query:
-        await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        await update.callback_query.message.reply_text(report, parse_mode="HTML", disable_web_page_preview=True)
 
 # ==================== 动态生成中缅双语帮助文本引擎 ====================
 def generate_help_text(lang='chinese'):
