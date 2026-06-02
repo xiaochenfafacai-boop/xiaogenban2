@@ -343,7 +343,122 @@ def generate_help_text(lang='chinese'):
 # ==================== 网页端对账看板网关 ====================
 @flask_app.route('/')
 def index():
-    return '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>实时课堂账单历史明细</title></head><body><h2 style="text-align:center;margin-top:50px;">实时多群分布式网页对账看板正在就绪中...</h2></body></html>'''
+    return '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>实时分布式网页对账看板</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { background-color: #f4f6f9; color: #333; padding: 12px; }
+        .container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); padding: 16px; }
+        .header { text-align: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid #edf2f7; }
+        .header h1 { font-size: 20px; color: #1a202c; margin-bottom: 4px; }
+        .header p { font-size: 13px; color: #718096; }
+        .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; }
+        .card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; text-align: center; }
+        .card .title { font-size: 12px; color: #64748b; margin-bottom: 4px; }
+        .card .value { font-size: 18px; font-weight: bold; color: #1e293b; }
+        .card.highlight-green { background: #f0fdf4; border-color: #bbf7d0; }
+        .card.highlight-green .value { color: #16a34a; }
+        .card.highlight-red { background: #fef2f2; border-color: #fca5a5; }
+        .card.highlight-red .value { color: #dc2626; }
+        .section-title { font-size: 15px; font-weight: bold; color: #334155; margin: 15px 0 8px 0; display: flex; align-items: center; gap: 6px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px; text-align: left; }
+        th, td { padding: 10px 8px; border-bottom: 1px solid #e2e8f0; }
+        th { background: #f1f5f9; color: #475569; font-weight: 6px; }
+        .badge-inc { background: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+        .badge-exp { background: #fee2e2; color: #b91c1c; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+        .empty-tip { text-align: center; color: #94a3b8; padding: 20px; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1 id="title-text">📊 实时多群分布式对账看板</h1>
+            <p id="date-text">数据加载中...</p>
+        </div>
+        
+        <div class="summary-grid">
+            <div class="card"><div class="title">常规汇率</div><div class="value" id="rate">0.00</div></div>
+            <div class="card highlight-green"><div class="title">总入款 (RMB)</div><div class="value" id="total_rmb">0</div></div>
+            <div class="card highlight-green"><div class="title">折合总入款 (USDT)</div><div class="value" id="total_usdt">0.00 U</div></div>
+            <div class="card highlight-red"><div class="title">已下发 (USDT)</div><div class="value" id="expense_usdt">0.00 U</div></div>
+            <div class="card" style="grid-column: span 2; background: #eff6ff; border-color: #bfdbfe;"><div class="title" style="color: #1e40af;">未下发尾款 (USDT)</div><div class="value" style="color: #1d4ed8; font-size: 22px;" id="remaining_usdt">0.00 U</div></div>
+        </div>
+
+        <div class="section-title">📥 进单明细流水</div>
+        <table>
+            <thead><tr><th>时间</th><th>备注</th><th>金额(RMB)</th><th>折合(U)</th></tr></thead>
+            <tbody id="income-list"><tr><td colspan="4" class="empty-tip">暂无入款记录</td></tr></tbody>
+        </table>
+
+        <div class="section-title">📤 下发/扣减明细流水</div>
+        <table>
+            <thead><tr><th>时间</th><th>备注</th><th>下发金额(USDT)</th></tr></thead>
+            <tbody id="expense-list"><tr><td colspan="3" class="empty-tip">暂无下发记录</td></tr></tbody>
+        </table>
+    </div>
+
+    <script>
+        async function loadBills() {
+            const params = new URLSearchParams(window.location.search);
+            const groupId = params.get('group_id') || '0';
+            const date = params.get('date') || '';
+            
+            try {
+                const response = await fetch(`/api/bill?group_id=${groupId}&date=${date}`);
+                const data = await response.json();
+                
+                if(data.error) {
+                    alert('拉取账单失败：' + data.msg);
+                    return;
+                }
+                
+                document.getElementById('rate').innerText = data.exchange_rate;
+                document.getElementById('total_rmb').innerText = data.total_rmb;
+                document.getElementById('total_usdt').innerText = data.total_usdt + ' U';
+                document.getElementById('expense_usdt').innerText = data.expense_usdt + ' U';
+                document.getElementById('remaining_usdt').innerText = data.remaining_usdt + ' U';
+                document.getElementById('date-text').innerText = '当前账单对齐日期：' + (date || new Date().toISOString().slice(0,10));
+
+                // 渲染入款明细
+                const incBody = document.getElementById('income-list');
+                if(data.income_bills && data.income_bills.length > 0) {
+                    incBody.innerHTML = data.income_bills.map(b => `
+                        <tr>
+                            <td style="color:#64748b;">${b.time}</td>
+                            <td><b>${b.remark}</b></td>
+                            <td><span class="badge-inc">+${b.amount}</span></td>
+                            <td style="font-weight:bold;color:#0f766e;">${b.usdt} U</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    incBody.innerHTML = '<tr><td colspan="4" class="empty-tip">📥 暂无入款流水分页</td></tr>';
+                }
+
+                // 渲染下发明细
+                const expBody = document.getElementById('expense-list');
+                if(data.expense_bills && data.expense_bills.length > 0) {
+                    expBody.innerHTML = data.expense_bills.map(b => `
+                        <tr>
+                            <td style="color:#64748b;">${b.time}</td>
+                            <td><b>${b.remark}</b></td>
+                            <td><span class="badge-exp">-${b.usdt} U</span></td>
+                        </tr>
+                    `).join('');
+                } else {
+                    expBody.innerHTML = '<tr><td colspan="3" class="empty-tip">📤 暂无下发流水分页</td></tr>';
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+        window.onload = loadBills;
+    </script>
+</body>
+</html>'''
 
 @flask_app.route('/api/bill')
 def api_bill():
