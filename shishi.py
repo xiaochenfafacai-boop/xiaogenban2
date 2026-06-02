@@ -284,33 +284,55 @@ def get_class_bills_by_date(group_id, target_date):
     conn.close()
     return income, expense, total_income, total_expense
 
-def send_text_bill_report(chat_id, gid, target_date):
+async def send_text_bill_report(update, gid, target_date):
     rate = get_setting(gid, 'exchange_rate') or 7.2
     income, expense, total_income, total_expense = get_class_bills_by_date(gid, target_date)
+
     total_rmb = total_income[0] if (total_income and total_income[0]) else 0
     total_usdt = total_income[1] if (total_income and total_income[1]) else 0
     expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
     remaining_usdt = total_usdt - expense_usdt
 
-    report = f"📊 <b>账单汇总 ({target_date})</b>\n\n📥 <b>入款 (最后5笔):</b>\n"
+    report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
+    
+    report += "📥 <b>入款 (仅显示最后5笔):</b>\n"
     if income:
+        # 只取最后5笔
         for row in income[-5:]:
             remark, username, amount, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
-            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U" + (f" ({remark}) [由 {username}]\n" if remark else f" [由 {username}]\n")
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U{rem_part}\n"
     else:
-        report += "  暂无入款数据\n"
+        report += "  暂无任何入款数据\n"
+
     if expense:
-        report += "\n📤 <b>下发 (最后5笔):</b>\n"
+        report += "\n📤 <b>下发 (仅显示最后5笔):</b>\n"
+        # 只取最后5笔
         for row in expense[-5:]:
             remark, username, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
-            report += f"  {time_str} 下发 {usdt_amount:.1f}U" + (f" ({remark}) [由 {username}]\n" if remark else f" [由 {username}]\n")
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} 下发 {usdt_amount:.1f}U{rem_part}\n"
 
-    report += f"\n💰 <b>汇率:</b> {rate:.2f}\n📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n📊 <b>已下发:</b> {expense_usdt:.1f}U\n📊 <b>未下发:</b> {remaining_usdt:.1f}U\n\n<code>[核算编号: {random.randint(1000,9999)}]</code>"
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton("📊 查看完整网页账单", url=f"{WEBHOOK_URL}?group_id={gid}"))
-    bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=markup)
+    report += f"\n💰 <b>汇率:</b> {rate:.2f}\n"
+    report += f"📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n"
+    report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
+    report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
+
+    bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
+    if not bot_username:
+        try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
+        except: bot_username = "xiaogenban_bot"
+        
+    keyboard = [
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
+    ]
+    
+    if update.message:
+        await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 # ==================== 5. 💬 Telegram 核心控制指令扩展网关 ====================
 
