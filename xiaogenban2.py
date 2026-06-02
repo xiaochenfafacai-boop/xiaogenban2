@@ -13,8 +13,8 @@ import os
 # ==================== 系统基础配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8617895746:AAF2vwr4laJ9GDKYwuyAJjNAMrf_TDjPu-0"
-WEB_URL = "https://xiaogenban-668hh.onrender.com"
+TOKEN = "8617895746:AAF9e2FmQcUMSf48876n5md6tvmEh3rk5oQ"
+WEB_URL = "https://xiaogenban-668gh.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
