@@ -19,7 +19,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ⚠️ 重要：请务必在此处替换为您去 @BotFather 重新获取的全新 Token
 TOKEN = "8617895746:AAEEJtvChCL0t_G4jvRE9D7FSVo_54-LnWQ"
-WEB_URL = "https://acai-668gg.onrender.com"
+WEB_URL = "https://shishi-888jkl.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
