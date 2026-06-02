@@ -18,8 +18,8 @@ from telegram.error import RetryAfter, TelegramError
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # ⚠️ 重要：请务必在此处替换为您去 @BotFather 重新获取的全新 Token
-TOKEN = "8617895746:AAFpXYwui8US0lDMmYhEmbeUEj46kRK4CAY"
-WEB_URL = "https://shishi-888jkl.onrender.com"
+TOKEN = "8617895746:AAEj8bwsC6Or8rpn3tkVjpbCQdfsDFarTwo"
+WEB_URL = "https://shishi-889jkl.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
