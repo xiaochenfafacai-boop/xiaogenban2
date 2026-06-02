@@ -14,7 +14,7 @@ import os
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 TOKEN = "8617895746:AAF9e2FmQcUMSf48876n5md6tvmEh3rk5oQ"
-WEB_URL = "https://xiaogenban-668gh.onrender.com"
+WEB_URL = "https://acai-668kg.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
@@ -133,58 +133,46 @@ def is_vip_user(user_id):
     except: pass
     return False
 
-def check_group_validity(group_id):
-    """
-    核心鉴权：只要买家老板没过期，所有绑定的群都绝对不能过期！
-    """
+# 已修改：让群组有效期直接跟拉机器人进群的买家或操作人的VIP状态绑定
+def check_group_validity(group_id, user_id=None):
+    # 1. 如果当前发消息的人本身就是有效VIP/创始人，直接允许使用
+    if user_id and (is_master(user_id) or is_vip_user(user_id)):
+        return True, "VIP特权期"
+
     conn = get_db_connection()
     c = conn.cursor()
-    
-    # 1. 查找当前群组绑定的买家/老板 (creator_id) 以及群自身的试用时间
-    c.execute("SELECT creator_id, expire_time FROM settings WHERE group_id = ?", (group_id,))
+    c.execute("SELECT operators, expire_time FROM settings WHERE group_id = ?", (group_id,))
     row = c.fetchone()
     
-    if not row:
-        conn.close()
-        return True, "新群初始化"
-        
-    creator_id, group_expire_str = row
-    
-    # 2. 🔥 核心联动买家身份：如果这个群属于某个买家，直接以买家的 VIP 有效期为准！
-    if creator_id:
-        # 如果是创始人，直接永久放行
-        if int(creator_id) in FOUNDER_USERS:
-            conn.close()
-            return True, "创始人永久授权"
-            
-        # 去 vip_users 表里反查这位买家老板的到期时间
-        c.execute("SELECT expire_time FROM vip_users WHERE user_id = ?", (creator_id,))
-        vip_row = c.fetchone()
-        
-        if vip_row:
-            vip_expire_str = vip_row[0]
-            try:
-                vip_expire = datetime.strptime(vip_expire_str, "%Y-%m-%d %H:%M:%S")
-                # 核心判断：只要当前时间还没到买家购买的截止时间，所有群一律放行！
-                if datetime.now() < vip_expire:
+    # 2. 如果群里有授权的操作人，检查操作人里有没有谁是有效VIP买家
+    if row:
+        try:
+            ops = json.loads(row[0] or '[]')
+            for op_id in ops:
+                if is_vip_user(op_id):
                     conn.close()
-                    return True, vip_expire_str  # 共享买家尊贵的 VIP 时间
-            except Exception as e:
-                logging.error(f"解析买家时间失败: {e}")
+                    return True, "管理员VIP有效"
+        except: pass
 
-    # 3. 如果该群没有绑定任何买家老板（散客群），才走群组自身的 1 天试用期判定
+    if not row:
+        tz_str = 'Asia/Shanghai'
+        _, _, trial_expire = get_current_time(tz_str)
+        trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
+        conn.commit()
+        conn.close()
+        return True, trial_expire
+
     conn.close()
-    if not group_expire_str:
-        return True, "未设置限制"
-        
-    try:
+    group_expire_str = row[1]
+    
+    if group_expire_str:
         group_expire = datetime.strptime(group_expire_str, "%Y-%m-%d %H:%M:%S")
         if datetime.now() < group_expire:
             return True, group_expire_str
-        else:
-            return False, group_expire_str
-    except:
-        return True, "时间格式错误跳过"
+            
+    return False, group_expire_str
 
 def can_use(group_id, user_id):
     if is_master(user_id) or is_vip_user(user_id): return True
@@ -260,109 +248,56 @@ def get_class_bills_by_date(group_id, target_date):
     return income, expense, total_income, total_expense
 
 # ==================== 统一账目文本渲染引擎 ====================
-async def send_text_bill_report(update, group_id, date_str):
-    """
-    发送账单日报统计
-    保持昨天的完美格式与计算，仅将群内显示的入款和下发明细限制为最后加的 5 笔
-    """
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    # 1. 调取当天所有账单（用于计算全局总和）
-    c.execute(
-        "SELECT id, username, remark, amount, bill_type, exchange_rate_snapshot, created_at "
-        "FROM bills WHERE group_id = ? AND date_str = ? ORDER BY id ASC",
-        (group_id, date_str)
-    )
-    all_rows = c.fetchall()
-    conn.close()
+# 已修改：限制入款和下发流水部分只在群内文本显示最后的5笔
+async def send_text_bill_report(update, gid, target_date):
+    rate = get_setting(gid, 'exchange_rate') or 7.2
+    income, expense, total_income, total_expense = get_class_bills_by_date(gid, target_date)
 
-    # 获取当前群组的环境设定
-    rate = float(get_setting(group_id, 'exchange_rate') or 0.0)
-    fee = float(get_setting(group_id, 'fee_rate') or 0.0)
-
-    # 建立入款和下发的空列表
-    income_rows = []
-    expense_rows = []
-
-    total_rmb = 0.0
-    expense_usdt = 0.0
-
-    # 2. 遍历数据：全量统计总账，同时将账单归类
-    for row in all_rows:
-        b_type = row[4]
-        b_amt = row[3]
-        if b_type == 'income':
-            income_rows.append(row)
-            total_rmb += b_amt
-        elif b_type == 'expense':
-            expense_rows.append(row)
-            expense_usdt += b_amt
-
-    # 汇总账目计算
-    total_usdt = total_rmb / rate if rate > 0 else 0.0
+    total_rmb = total_income[0] if (total_income and total_income[0]) else 0
+    total_usdt = total_income[1] if (total_income and total_income[1]) else 0
+    expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
     remaining_usdt = total_usdt - expense_usdt
 
-    # 3. 开始拼装完美的排版格式
-    report = f"📊 <b>今日账单汇总 {date_str}</b>\n"
-    report += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-
-    # 【📥 入款明细处理】：只在群里展示最后加的 5 笔
-    inc_count = len(income_rows)
-    report += f"📥 入款({inc_count} 笔):\n"
-    if not income_rows:
-        report += "  ㅤ 暂无入款数据\n"
-    else:
-        # ⭐ 核心改动：用切片 [-5:] 只取出最后加的 5 笔账单
-        for row in income_rows[-5:]:
-            timestamp = row[6]
+    report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
+    
+    report += "📥 <b>入款 (仅显示最后5笔):</b>\n"
+    if income:
+        # 只取最后5笔
+        for row in income[-5:]:
+            remark, username, amount, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
-            b_amt = row[3]
-            b_rate = row[5] or rate
-            u_amt = b_amt / b_rate if b_rate > 0 else 0.0
-            rem_part = f" ({row[2]})" if row[2] else ""
-            
-            report += f"  ㅤ {time_str}  {b_amt:.0f} / {b_rate:.0f} = {u_amt:.2f} U{rem_part}\n"
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} {amount:.0f}/{ex_rate:.2f}= {usdt_amount:.1f}U{rem_part}\n"
+    else:
+        report += "  暂无任何入款数据\n"
+
+    if expense:
+        report += "\n📤 <b>下发 (仅显示最后5笔):</b>\n"
+        # 只取最后5笔
+        for row in expense[-5:]:
+            remark, username, usdt_amount, ex_rate, timestamp = row
+            time_str = timestamp[11:16] if timestamp else "00:00"
+            rem_part = f" ({remark})" if remark else ""
+            report += f"  {time_str} 下发 {usdt_amount:.1f}U{rem_part}\n"
+
+    report += f"\n💰 <b>汇率:</b> {rate:.2f}\n"
+    report += f"📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n"
+    report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
+    report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
+
+    bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
+    if not bot_username:
+        try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
+        except: bot_username = "xiaogenban_bot"
         
-        # 如果总笔数超过 5 笔，优雅打印省略提示
-        if inc_count > 5:
-            report += f"  ... 还有 {inc_count - 5} 笔\n"
-
-    report += "\n"
-
-    # 【📤 下发明细处理】：只在群里展示最后加的 5 笔
-    exp_count = len(expense_rows)
-    report += f"📤 下发({exp_count} 笔):\n"
-    if not expense_rows:
-        report += "  ㅤ 暂无下发数据\n"
-    else:
-        # ⭐ 核心改动：同样用切片 [-5:] 只取出最后加的 5 笔下发
-        for row in expense_rows[-5:]:
-            timestamp = row[6]
-            time_str = timestamp[11:16] if timestamp else "00:00"
-            b_amt = row[3]
-            rem_part = f" ({row[2]})" if row[2] else ""
-            
-            report += f"  ㅤ {time_str}  下发 {b_amt:.1f}U{rem_part}\n"
-            
-        if exp_count > 5:
-            report += f"  ... 还有 {exp_count - 5} 笔\n"
-
-    # 4. 拼装底部总账数据（保持昨天的完美格式）
-    report += f"\n💰 <b>汇率：</b>{rate:.2f}\n"
-    report += f"📊 <b>总入款：</b>{total_rmb:.0f} | {total_usdt:.2f} U\n"
-    report += f"📊 <b>已下发：</b>{expense_usdt:.2f} U\n"
-    report += f"📊 <b>未下发：</b>{remaining_usdt:.2f} U\n"
-
-    # 5. 生成动态对账 Web 网页跳转链接
-    web_url = f"{WEB_URL}?group_id={group_id}&date={date_str}"
-    report += f"（<a href='{web_url}'>查看完整账单（web）</a>）"
-
-    # 6. 发送群消息
+    keyboard = [
+        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
+    ]
+    
     if update.message:
-        await update.message.reply_text(report, parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     elif update.callback_query:
-        await update.callback_query.message.reply_text(report, parse_mode="HTML", disable_web_page_preview=True)
+        await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
 # ==================== 动态生成中缅双语帮助文本引擎 ====================
 def generate_help_text(lang='chinese'):
@@ -791,10 +726,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # --- 群组内核心业务逻辑 ---
-    is_valid, expire_date_str = check_group_validity(gid)
+    # 已修改：传入发消息的用户UID进行联合判定
+    is_valid, expire_date_str = check_group_validity(gid, uid)
     if not is_valid:
-        if is_master(uid) or is_vip_user(uid):
-            await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成多群独立授权面板。", parse_mode="HTML")
+        await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成多群独立授权面板。", parse_mode="HTML")
         return
 
     # 获取基础环境数据
@@ -815,7 +750,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_text_bill_report(update, gid, today_str)
         return
 
-    # ⭐【补回功能 1】：设置汇率
     if text.startswith('设置汇率'):
         if not can_use(gid, uid): return
         try:
@@ -826,7 +760,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("⚠️ 格式错误。示例：`设置汇率 7.25`")
         return
 
-    # ⭐【补回功能 2】：设置费率
     if text.startswith('设置费率'):
         if not can_use(gid, uid): return
         try:
