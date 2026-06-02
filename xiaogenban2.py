@@ -11,6 +11,7 @@ from flask import Flask, request, jsonify
 import os
 import asyncio
 import random
+import requests  # 👈 新增：用于请求波场区块链网关
 from telegram.error import RetryAfter, TelegramError
 
 # ==================== 系统基础配置 ====================
@@ -18,11 +19,14 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # ⚠️ 重要：请务必在此处替换为您去 @BotFather 重新获取的全新 Token
 TOKEN = "8617895746:AAEEJtvChCL0t_G4jvRE9D7FSVo_54-LnWQ"
-WEB_URL = "https://shishi-669dk.onrender.com"
+WEB_URL = "https://acai-668gg.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
 TRON_ADDRESS = "TVnjLwDrGjYVRTa1ukfoE2mFTmCxtrjoCw"
+
+# 💡 建议去 tronscan.org 注册一个免费的 API KEY 填在这里。如果不填，高频查询可能会被波场官网限流。
+TRONSCAN_API_KEY = "" 
 
 PRICE_1_MONTH = 80
 PRICE_2_MONTH = 130
@@ -30,10 +34,61 @@ PRICE_3_MONTH = 220
 
 flask_app = Flask(__name__)
 
-# ==================== 🛡️ 工业级异步高并发防封发送引擎 🛡️ ====================
+# ==================== 🌐 新增：区块链波场链上数据抓取引擎 ====================
+def fetch_blockchain_usdt_info(address):
+    headers = {"TRON-PRO-API-KEY": TRONSCAN_API_KEY} if TRONSCAN_API_KEY else {}
+    USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # 波场 USDT 官方智能合约地址
+    
+    try:
+        # 1. 抓取该地址的全部代币资产
+        account_url = f"https://apilist.tronscanapi.com/api/account/tokens?address={address}"
+        response = requests.get(account_url, headers=headers, timeout=10)
+        
+        usdt_balance = 0.0
+        if response.status_code == 200:
+            data = response.json()
+            for token in data.get('data', []):
+                if token.get('tokenId') == USDT_CONTRACT:
+                    usdt_balance = float(token.get('amount', 0)) / 1000000  # 精度除以 10^6
+                    break
+                    
+        # 2. 抓取该地址最近的 TRC20 (USDT) 转账流水明细
+        tx_url = f"https://apilist.tronscanapi.com/api/token_trc20/transfers?limit=5&start=0&sort=-timestamp&contract_address={USDT_CONTRACT}&relatedAddress={address}"
+        tx_response = requests.get(tx_url, headers=headers, timeout=10)
+        
+        history_text = ""
+        if tx_response.status_code == 200:
+            tx_data = tx_response.json()
+            tx_list = tx_data.get('token_transfers', [])
+            
+            if not tx_list:
+                history_text = "  暂无最近的 USDT 转账流水。"
+            else:
+                for tx in tx_list:
+                    from_addr = tx.get('from_address', '')
+                    to_addr = tx.get('to_address', '')
+                    amount = float(tx.get('quant', 0)) / 1000000
+                    
+                    # 判断是进账还是出账，并对地址进行保密美化处理
+                    if from_addr.lower() == address.lower():
+                        direction = "🔴 支出"
+                        peer_info = f"去往: {to_addr[:6]}***{to_addr[-6:]}"
+                    else:
+                        direction = "🟢 收入"
+                        peer_info = f"来自: {from_addr[:6]}***{from_addr[-6:]}"
+                        
+                    history_text += f"  {direction} | <b>{amount:.2f} U</b>\n  └ <i>{peer_info}</i>\n"
+        else:
+            history_text = "  ⚠️ 暂时无法获取流水明细，请稍后再试。"
+            
+        return {"success": True, "balance": usdt_balance, "history": history_text}
+        
+    except Exception as e:
+        return {"success": False, "msg": str(e)}
+
+# ==================== 🛡️ 工业级异步高并发防封发送引擎 ====================
 class TelegramSmartLimiter:
     def __init__(self):
-        # 严守官方全网每秒最多 30 条死线，设定全局并发信号量为 25
         self.global_semaphore = asyncio.Semaphore(25)
         self.group_locks = {}
 
@@ -46,14 +101,11 @@ limiter = TelegramSmartLimiter()
 
 async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode="HTML", reply_markup=None):
     group_lock = limiter.get_group_lock(chat_id)
-    
-    # 核心流量整形：全局限流与单群平滑发送双重锁
     async with limiter.global_semaphore:
         async with group_lock:
             for attempt in range(3):
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-                    # 满足大账单高频吞吐流：发出后进行 0.25 秒微秒级平滑交替，彻底打散发送指纹，防止官方风控检测
                     await asyncio.sleep(0.25)
                     return True
                 except RetryAfter as e:
@@ -286,9 +338,7 @@ async def send_text_bill_report(update, gid, target_date, context: ContextTypes.
 
     random_fingerprint = f"\n\n<code>[核算编号: {random.randint(1000,9999)}]</code>"
 
-    # 完全重现最初始、最完整的长账单大报告样式
     report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
-    
     report += "📥 <b>入款 (仅显示最后5笔):</b>\n"
     if income:
         for row in income[-5:]:
@@ -313,7 +363,6 @@ async def send_text_bill_report(update, gid, target_date, context: ContextTypes.
     report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
     report += random_fingerprint
 
-    # 包含网页端实时看账看板的按钮链接
     keyboard = [[InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]]
     await safe_send_message(context, chat_id=gid, text=report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -334,13 +383,14 @@ def generate_help_text(lang='chinese'):
 `备注+2000` - 带备注入款
 `下发50` / `ထုတ်50` - 下发50 USDT
 `+0` - 查看今日汇总
+`查看 Txxxx...` - 🔍链上实时排查指定波场USDT钱包资产明细
 
 📌 *删除命令：*
 `删今天` - 清空今日所有账单
 `全部清单` - 清空本群历史全部记录
 `清单+备注` - 删除今天指定备注的进单记录"""
 
-# ==================== 网页端对账看板网关 ====================
+# ==================== 实时分布式对账看板前端网页 ====================
 @flask_app.route('/')
 def index():
     return '''<!DOCTYPE html>
@@ -404,6 +454,7 @@ def index():
     <script>
         async function loadBills() {
             const params = new URLSearchParams(window.location.search);
+            // 🌟 自动抓取网页链接后缀中的真实群ID，保证跨多群时账目永不错乱
             const groupId = params.get('group_id') || '0';
             const date = params.get('date') || '';
             
@@ -449,7 +500,7 @@ def index():
                         </tr>
                     `).join('');
                 } else {
-                    expBody.innerHTML = '<tr><td colspan="3" class="empty-tip">📤 暂无下发流水分页</td></tr>';
+                    expBody.innerHTML = '<tr><td colspan="3" class="empty-tip">📤 暂无下发记录</td></tr>';
                 }
             } catch (e) {
                 console.error(e);
@@ -488,27 +539,17 @@ def get_private_reply_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="请选择业务管理面板")
 
-# ==================== 🛠️ 核心新增：自动加入新群打招呼欢迎处理器 ====================
+# ==================== 自动加入新群欢迎处理器 ====================
 async def on_bot_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 判定机器人自身状态改变
-    if not update.my_chat_member:
-        return
-        
+    if not update.my_chat_member: return
     old_status = update.my_chat_member.old_chat_member.status
     new_status = update.my_chat_member.new_chat_member.status
     gid = update.my_chat_member.chat.id
     chat_type = update.my_chat_member.chat.type
 
-    # 当机器人被新“加入”到超级群组或普通群组时触发
     if chat_type in ["group", "supergroup"] and new_status in ["member", "administrator"] and old_status not in ["member", "administrator"]:
-        # 自动初始化这个新群的数据库默认基础配置
         check_group_validity(gid)
-        
-        # 自动发送进群激活指引，完美符合您的指定文本要求
-        welcome_text = (
-            "感谢您把我添加到贵群!\n"
-            "下一步为我可以开始记账，请发：<code>上课</code>"
-        )
+        welcome_text = "感谢您把我添加到贵群!\n下一步为我可以开始记账，请发：<code>上课</code>"
         await safe_send_message(context, chat_id=gid, text=welcome_text, parse_mode="HTML")
 
 # ==================== 商业化业务层处理器 ====================
@@ -517,11 +558,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     if update.effective_chat.type == "private":
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
-        welcome = (
-            "<b>欢迎使用多群分布式商用记账系统</b>\n\n"
-            "将本机器人直接加入您所需要管理的多个业务群组即可使用。\n"
-            "群组使用权限将自动联动您的商用买家身份账户续费周期。"
-        )
+        welcome = "<b>欢迎使用多群分布式商用记账系统</b>\n\n将本机器人直接加入您所需要管理的多个业务群组即可使用。\n群组使用权限将自动联动您的商用买家身份账户续费周期。"
         await safe_send_message(context, uid, welcome, parse_mode="HTML", reply_markup=get_private_reply_keyboard())
     else:
         await safe_send_message(context, gid, "📊 多群分布式智能记账核算核心已部署就绪！输入 <code>上课</code> 启动录入。")
@@ -644,7 +681,36 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await safe_send_message(context, uid, "💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
         return
 
-    # --- 群组内到期判定 ---
+    # ==================== 🌟 新增：独立于“上课/下课”的区块链实时查询接口 ====================
+    if text.startswith("查看"):
+        parts = text.split()
+        if len(parts) >= 2:
+            target_address = parts[1].strip()
+            # 波场链上钱包地址特征校验：大写T开头，长度34位
+            if target_address.startswith("T") and len(target_address) == 34:
+                # 提示查询中，防止链上拥堵导致买家误以为机器人死机
+                wait_msg = await update.message.reply_text("🔍 正在连接波场TRON全节点进行实时检索，请稍候...")
+                
+                # 在线程池中执行耗时的外部网络API请求，保证大群高并发记账绝不发生卡顿
+                loop = asyncio.get_running_loop()
+                chain_res = await loop.run_in_executor(None, fetch_blockchain_usdt_info, target_address)
+                
+                # 删除等待提示并回显结果
+                try: await context.bot.delete_message(chat_id=gid, message_id=wait_msg.message_id)
+                except: pass
+                
+                if chain_res["success"]:
+                    report_text = (
+                        f"👤 <b>查询目标地址：</b>\n<code>{target_address}</code>\n\n"
+                        f"💰 <b>USDT 当前余额：</b> <code>{chain_res['balance']:.2f}</code> U\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 <b>最近 5 笔链上流向明细：</b>\n\n{chain_res['history']}"
+                    )
+                    await update.message.reply_text(report_text, parse_mode="HTML")
+                else:
+                    await update.message.reply_text(f"❌ 检索失败，原因：{chain_res['msg']}")
+                return
+
     is_valid, _ = check_group_validity(gid, uid)
     if not is_valid:
         try: await context.bot.send_message(chat_id=uid, text="⚠️ <b>您的多群独立授权已到期，请您续费后使用机器人。</b>", parse_mode="HTML")
@@ -719,7 +785,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             rate_val = float(text.replace('设置汇率', '').strip())
             update_setting(gid, 'exchange_rate', rate_val)
-            await safe_send_message(context, gid, f"💱 <b>汇率修改成功！当前群常规汇率已变更为：【{rate_val:.2f}】</b>", parse_mode="HTML")
+            await safe_send_message(context, gid, f"💱 <b>汇率修改成功！当前群常规汇率已变变成：【{rate_val:.2f}】</b>", parse_mode="HTML")
         except: pass
         return
 
@@ -772,7 +838,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_text_bill_report(update, gid, today_str, context)
         return
 
-    # 🌟 无论输入什么记账指令，100% 回复以前最完整、带有明细和大按钮的长账单表格
     m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
     if m_exp:
         add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
@@ -802,11 +867,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     ]
     for f_id in FOUNDER_USERS:
         try:
-            await context.bot.send_photo(
-                chat_id=f_id, photo=photo_id, 
-                caption=f"📸 <b>报告老板，有买家提交转账截图啦！</b>\n\n买家UID: <code>{uid}</code>\n买家用户名: @{update.effective_user.username or '无'}", 
-                reply_markup=InlineKeyboardMarkup(app_k), parse_mode="HTML"
-            )
+            await context.bot.send_photo(chat_id=f_id, photo=photo_id, caption=f"📸 <b>报告老板，有买家提交转账截图啦！</b>\n\n买家UID: <code>{uid}</code>\n买家用户名: @{update.effective_user.username or '无'}", reply_markup=InlineKeyboardMarkup(app_k), parse_mode="HTML")
             await asyncio.sleep(1.0)
         except: pass
     await safe_send_message(context, uid, "📥 <b>您的入账转账截图已经提交至后台审核系统，请等待开通提示！</b>", parse_mode="HTML")
@@ -815,17 +876,13 @@ def main():
     init_db()
     threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=PORT), daemon=True).start()
     
-    # 核心高并发异步引擎调优参数：允许同时处理多群多命令（True）
     app = Application.builder().token(TOKEN).concurrent_updates(True).build()
-    
-    # 🌟 注册进群监听网关句柄
     app.add_handler(ChatMemberHandler(on_bot_join_group, ChatMemberHandler.MY_CHAT_MEMBER))
-    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    print("🤖 全新自动进群致谢欢迎 + 纯净完整长账单版机器人启动就绪...")
+    print("🤖 豪华网页对账看板+区块链独立查询版内核已就绪...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
