@@ -13,7 +13,7 @@ import requests
 # ==================== 1. 系统核心配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAE8D_GcatHeustkKVqGCtnyc9BVA5Xc2-k')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '8965619504:AAEx0leJ6_u34JulGd6swtbgizHy1IK8Muo')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL', 'https://shishi-668gg.onrender.com')
 PORT = int(os.environ.get('PORT', 5000))
 
