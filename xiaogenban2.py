@@ -4,17 +4,21 @@ import json
 from datetime import datetime, timedelta
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ChatMemberHandler
 import re
 import threading
 from flask import Flask, request, jsonify
 import os
+import asyncio
+import random
+from telegram.error import RetryAfter, TelegramError
 
 # ==================== 系统基础配置 ====================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-TOKEN = "8617895746:AAF9e2FmQcUMSf48876n5md6tvmEh3rk5oQ"
-WEB_URL = "https://acai-668kg.onrender.com"
+# ⚠️ 重要：请务必在此处替换为您去 @BotFather 重新获取的全新 Token
+TOKEN = "8617895746:AAEEJtvChCL0t_G4jvRE9D7FSVo_54-LnWQ"
+WEB_URL = "https://shishi-669dk.onrender.com"
 PORT = int(os.environ.get('PORT', 8080))
 
 FOUNDER_USERS = [8179896441]
@@ -25,6 +29,40 @@ PRICE_2_MONTH = 130
 PRICE_3_MONTH = 220
 
 flask_app = Flask(__name__)
+
+# ==================== 🛡️ 工业级异步高并发防封发送引擎 🛡️ ====================
+class TelegramSmartLimiter:
+    def __init__(self):
+        # 严守官方全网每秒最多 30 条死线，设定全局并发信号量为 25
+        self.global_semaphore = asyncio.Semaphore(25)
+        self.group_locks = {}
+
+    def get_group_lock(self, group_id):
+        if group_id not in self.group_locks:
+            self.group_locks[group_id] = asyncio.Lock()
+        return self.group_locks[group_id]
+
+limiter = TelegramSmartLimiter()
+
+async def safe_send_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, parse_mode="HTML", reply_markup=None):
+    group_lock = limiter.get_group_lock(chat_id)
+    
+    # 核心流量整形：全局限流与单群平滑发送双重锁
+    async with limiter.global_semaphore:
+        async with group_lock:
+            for attempt in range(3):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+                    # 满足大账单高频吞吐流：发出后进行 0.25 秒微秒级平滑交替，彻底打散发送指纹，防止官方风控检测
+                    await asyncio.sleep(0.25)
+                    return True
+                except RetryAfter as e:
+                    logging.warning(f"⚠️ 触发 Telegram 瞬时洪水防御！要求强制等待 {e.retry_after} 秒")
+                    await asyncio.sleep(e.retry_after + 1)
+                except TelegramError as e:
+                    logging.error(f"❌ 目标群组/用户 {chat_id} 发送失败，机器人可能已被踢出群组: {e}")
+                    return False
+    return False
 
 # ==================== 数据库引擎 ====================
 def get_db_connection():
@@ -89,7 +127,7 @@ def get_current_time(timezone_str):
         now = datetime.now(tz)
         return now, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
 
-# ==================== 权限判定核心 ====================
+# ==================== 权限与有效判定核心 ====================
 def get_all_masters():
     masters = list(FOUNDER_USERS)
     try:
@@ -133,46 +171,35 @@ def is_vip_user(user_id):
     except: pass
     return False
 
-# 已修改：让群组有效期直接跟拉机器人进群的买家或操作人的VIP状态绑定
 def check_group_validity(group_id, user_id=None):
-    # 1. 如果当前发消息的人本身就是有效VIP/创始人，直接允许使用
-    if user_id and (is_master(user_id) or is_vip_user(user_id)):
-        return True, "VIP特权期"
+    if user_id and is_master(user_id):
+        return True, "MASTER_BYPASS"
+    if user_id and is_vip_user(user_id):
+        return True, "VIP_DIRECT_PASS"
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT operators, expire_time FROM settings WHERE group_id = ?", (group_id,))
+    c.execute("SELECT operators FROM settings WHERE group_id = ?", (group_id,))
     row = c.fetchone()
     
-    # 2. 如果群里有授权的操作人，检查操作人里有没有谁是有效VIP买家
     if row:
         try:
             ops = json.loads(row[0] or '[]')
             for op_id in ops:
                 if is_vip_user(op_id):
                     conn.close()
-                    return True, "管理员VIP有效"
+                    return True, "VIP_OPERATOR_VALID"
         except: pass
-
-    if not row:
+        conn.close()
+    else:
         tz_str = 'Asia/Shanghai'
-        _, _, trial_expire = get_current_time(tz_str)
-        trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
+        _, _, init_time = get_current_time(tz_str)
+        c.execute("INSERT OR IGNORE INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, init_time))
         conn.commit()
         conn.close()
-        return True, trial_expire
 
-    conn.close()
-    group_expire_str = row[1]
-    
-    if group_expire_str:
-        group_expire = datetime.strptime(group_expire_str, "%Y-%m-%d %H:%M:%S")
-        if datetime.now() < group_expire:
-            return True, group_expire_str
-            
-    return False, group_expire_str
+    return False, "EXPIRED"
 
 def can_use(group_id, user_id):
     if is_master(user_id) or is_vip_user(user_id): return True
@@ -201,7 +228,7 @@ def update_setting(group_id, key, value):
         if c.fetchone():
             c.execute(f"UPDATE settings SET {key} = ? WHERE group_id = ?", (value, group_id))
         else:
-            trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            trial_expire = (datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
             c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                       (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
             c.execute(f"UPDATE settings SET {key} = ? WHERE group_id = ?", (value, group_id))
@@ -248,8 +275,7 @@ def get_class_bills_by_date(group_id, target_date):
     return income, expense, total_income, total_expense
 
 # ==================== 统一账目文本渲染引擎 ====================
-# 已修改：限制入款和下发流水部分只在群内文本显示最后的5笔
-async def send_text_bill_report(update, gid, target_date):
+async def send_text_bill_report(update, gid, target_date, context: ContextTypes.DEFAULT_TYPE):
     rate = get_setting(gid, 'exchange_rate') or 7.2
     income, expense, total_income, total_expense = get_class_bills_by_date(gid, target_date)
 
@@ -258,11 +284,13 @@ async def send_text_bill_report(update, gid, target_date):
     expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
     remaining_usdt = total_usdt - expense_usdt
 
+    random_fingerprint = f"\n\n<code>[核算编号: {random.randint(1000,9999)}]</code>"
+
+    # 完全重现最初始、最完整的长账单大报告样式
     report = f"📊 <b>账单汇总 ({target_date})</b>\n\n"
     
     report += "📥 <b>入款 (仅显示最后5笔):</b>\n"
     if income:
-        # 只取最后5笔
         for row in income[-5:]:
             remark, username, amount, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
@@ -273,7 +301,6 @@ async def send_text_bill_report(update, gid, target_date):
 
     if expense:
         report += "\n📤 <b>下发 (仅显示最后5笔):</b>\n"
-        # 只取最后5笔
         for row in expense[-5:]:
             remark, username, usdt_amount, ex_rate, timestamp = row
             time_str = timestamp[11:16] if timestamp else "00:00"
@@ -284,291 +311,105 @@ async def send_text_bill_report(update, gid, target_date):
     report += f"📊 <b>总入款:</b> {total_rmb:.0f} | {total_usdt:.1f}U\n"
     report += f"📊 <b>已下发:</b> {expense_usdt:.1f}U\n"
     report += f"📊 <b>未下发:</b> {remaining_usdt:.1f}U"
+    report += random_fingerprint
 
-    bot_username = update.current_message.bot.username if hasattr(update, 'current_message') and update.current_message else ''
-    if not bot_username:
-        try: bot_username = (await update.message.chat.get_member(update.message.bot.id)).user.username
-        except: bot_username = "xiaogenban_bot"
-        
-    keyboard = [
-        [InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]
-    ]
-    
-    if update.message:
-        await update.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(report, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    # 包含网页端实时看账看板的按钮链接
+    keyboard = [[InlineKeyboardButton("📊 查看完整账单 (Web)", url=f"{WEB_URL}?group_id={gid}")]]
+    await safe_send_message(context, chat_id=gid, text=report, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ==================== 动态生成中缅双语帮助文本引擎 ====================
+# ==================== 中缅双语帮助文本引擎 ====================
 def generate_help_text(lang='chinese'):
     if lang == 'myanmar':
         return """🤖 *စာရင်းကိုင်ဘော့ အကူအညီ* (Help)
 📌 *စာရင်းသွင်းရန် ပုံစံများ：*
 `+1000` - Ngwe Win 1000 Kyat
 `-1000` - Ngwe Win -1000 Kyat
-`备注+2000` - 带备注入款
-`备注-2000` - 带备注减款
 `Thut50` / `下发50` - 50 USDT Thut Ranyan
-`备注下发50` - 带备注下发
-`+0` - YaNay SaYinChoke KyiRanyan
-
-📌 *စီမံခန့်ခွဲရေး ကွတ်ကီးများ：*
-`上课` - 开启记账系统
-`下课` - 关闭记账并清算今日
-`设置汇率 7.2` - 修改群常规汇率
-`设置操作人 @用户名` - 授权群成员协助记账
-`查看操作员列表` - 查看本群操作人
-`改语言` - 切换语言 (中文/မြန်မာ)
-`设置时间 china/myanmar` - 变更结算时区"""
+`+0` - YaNay SaYinChoke KyiRanyan"""
     else:
         return """🤖 *记账机器人使用指南*
 📌 *记账格式：*
 `+1000` - 入款1000元
 `-1000` - 入款-1000元 (扣减款)
 `备注+2000` - 带备注入款
-`备注-2000` - 带备注减款
 `下发50` / `ထုတ်50` - 下发50 USDT
-`备注下发50` - 带备注下发50 USDT
 `+0` - 查看今日汇总
 
-📌 *管理命令：*
-`上课` - 开启记账模式
-`下课` - 关闭记账模式并归档
-`设置汇率 7.2` - 设置当前常规汇率
-`设置操作人 @用户名` - 授权群成员协助记账（可直接@或回复消息）
-`查看操作员列表` - 查看本群操作人
-`改语言` - 切换群内系统语言（中文/缅甸语）
-`设置时间 china/myanmar` - 调整本群结算时区
-
 📌 *删除命令：*
-`删今天` - 清空今日账单 | `删最后` - 撤销最后一笔
-`全部清单` - 清空历史 | `清单+备注` - 删除指定备注账单"""
+`删今天` - 清空今日所有账单
+`全部清单` - 清空本群历史全部记录
+`清单+备注` - 删除今天指定备注的进单记录"""
 
-# ==================== 网页端明细对账看板 ====================
+# ==================== 网页端对账看板网关 ====================
 @flask_app.route('/')
 def index():
-    return '''<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>实时课堂账单历史明细</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box;}
-        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f3f4f9;padding:12px;color:#333;}
-        .container{max-width:800px;margin:0 auto;background:#fff;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,0.06);overflow:hidden;}
-        .header-banner {background: linear-gradient(135deg, #5b62e7 0%, #8561ea 100%); color: #fff; padding: 22px 18px; position: relative;}
-        .header-banner h1 { font-size: 19px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
-        .header-banner p { font-size: 12px; opacity: 0.85; margin-top: 5px; }
-        .date-badge {position: absolute; right: 15px; bottom: 18px; background: rgba(255,255,255,0.23); padding: 5px 10px; border-radius: 8px; display: flex; align-items: center; gap: 5px; font-size: 12px; border: 1px solid rgba(255,255,255,0.15);}
-        .date-badge input { background: transparent; border: none; color: white; outline: none; font-size: 12px; cursor: pointer; font-weight: bold; }
-        .main-content { padding: 16px; }
-        .table-title { font-size: 15px; font-weight: bold; color: #3c42be; margin: 15px 0 10px 0; display: flex; align-items: center; gap: 5px; border-bottom: 1px solid #eef0f6; padding-bottom: 8px; }
-        .table-wrapper { width: 100%; overflow-x: auto; margin-bottom: 15px; border-radius: 8px; border: 1px solid #edf0f5; }
-        table { width: 100%; border-collapse: collapse; background: #fff; min-width: 500px; }
-        th, td { padding: 10px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid #edf0f5; }
-        th { background: #f8f9fc; color: #6e758b; font-weight: 500; font-size: 12px; }
-        td { color: #444; }
-        .cate-box { background: #fff; border: 1px solid #edf0f5; border-radius: 8px; padding: 12px; margin-bottom: 18px; }
-        .cate-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; padding: 6px 0; border-bottom: 1px dashed #f0f2f7; }
-        .cate-row:last-child { border-bottom: none; }
-        .cate-tag { font-weight: bold; color: #ff9800; display: flex; align-items: center; gap: 4px; }
-        .cate-val { font-size: 13px; font-weight: 600; color: #4b52be; }
-        .grid-container { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 15px; }
-        .card { background: #f8f9fc; border-radius: 10px; padding: 12px; text-align: center; border: 1px solid #f0f2f7; }
-        .card-label { font-size: 11px; color: #8c93a6; margin-bottom: 5px; display: flex; align-items: center; justify-content: center; gap: 3px; }
-        .card-value { font-size: 16px; font-weight: bold; color: #2d3142; }
-        .no-data { text-align: center; padding: 30px; color: #a0a7b5; font-size: 13px; background: #fafbfe; border-radius: 8px; }
-        .loading-shimmer { text-align: center; padding: 50px; color: #623ce4; font-size: 14px; font-weight: 500; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header-banner">
-            <h1>📋 实时课堂账单历史明细</h1>
-            <p>默认同步实时账单 · 数据每4秒自动更新</p>
-            <div class="date-badge">
-                📅 <input type="date" id="targetDate" onchange="dateChanged()">
-            </div>
-        </div>
-        <div class="main-content" id="viewShell">
-            <div class="loading-shimmer">正在安全对账通道拉取实时流数据...</div>
-        </div>
-    </div>
-    <script>
-        let gId = "";
-        let selectedDay = "";
-        function parseQuery() {
-            const urlParams = new URLSearchParams(window.location.search);
-            gId = urlParams.get('group_id');
-            if(!gId) {
-                document.getElementById('viewShell').innerHTML = `<div class="no-data" style="color:red; font-weight:bold;">❌ 握手失败：未携带合法的对账凭证秘钥</div>`;
-                return false;
-            }
-            const d = new Date();
-            let m = d.getMonth() + 1; let day = d.getDate();
-            selectedDay = `${d.getFullYear()}-${m<10?'0'+m:m}-${day<10?'0'+day:day}`;
-            document.getElementById('targetDate').value = selectedDay;
-            return true;
-        }
-        function dateChanged() {
-            selectedDay = document.getElementById('targetDate').value;
-            fetchData();
-        }
-        async function fetchData() {
-            if(!gId) return;
-            try {
-                const res = await fetch(`/api/bill?group_id=${gId}&date=${selectedDay}&_cache_burst=${new Date().getTime()}`);
-                const data = await res.json();
-                let html = "";
-                html += `<div class="table-title">📥 入款记录 (${data.income_bills.length} 笔)</div>`;
-                if(data.income_bills.length > 0) {
-                    html += `<div class="table-wrapper"><table><thead><tr><th>备注</th><th>时间</th><th>金额(元)</th><th>汇率</th><th>等值数量</th><th>操作人</th></tr></thead><tbody>`;
-                    data.income_bills.forEach(b => {
-                        html += `<tr><td><b>${b.remark}</b></td><td>${b.time}</td><td>${b.amount}</td><td>${b.exchange_rate}</td><td style="color:#2ecc71;font-weight:bold;">${b.usdt} USDT</td><td>${b.username}</td></tr>`;
-                    });
-                    html += `</tbody></table></div>`;
-                } else {
-                    html += `<div class="no-data">本日暂无任何入款账单流转</div>`;
-                }
-                if(data.summary_by_remark && Object.keys(data.summary_by_remark).length > 0) {
-                    html += `<div class="table-title">📊 备注分类统计</div><div class="cate-box">`;
-                    for(const [rem, val] of Object.entries(data.summary_by_remark)) {
-                        html += `<div class="cate-row"><span class="cate-tag">📝 ${rem}</span><span class="cate-val">${val.count}笔 | ${val.rmb}元 | ${val.usdt} USDT</span></div>`;
-                    }
-                    html += `</div>`;
-                }
-                html += `<div class="table-title">📤 下发记录明细 (${data.expense_bills.length} 笔)</div>`;
-                if(data.expense_bills.length > 0) {
-                    html += `<div class="table-wrapper"><table><thead><tr><th>备注</th><th>时间</th><th>下发数量(USDT)</th><th>操作人</th></tr></thead><tbody>`;
-                    data.expense_bills.forEach(b => {
-                        html += `<tr><td><b>${b.remark}</b></td><td>${b.time}</td><td style="color:#e74c3c;font-weight:bold;">${b.usdt} USDT</td><td>${b.username}</td></tr>`;
-                    });
-                    html += `</tbody></table></div>`;
-                } else {
-                    html += `<div class="no-data">本日暂无任何下发数据流转</div>`;
-                }
-                html += `<div class="grid-container">
-                    <div class="card"><div class="card-label">💰 费率</div><div class="card-value">${data.fee_rate}%</div></div>
-                    <div class="card"><div class="card-label">💱 汇率</div><div class="card-value" style="color:#4b52be;">${data.exchange_rate}</div></div>
-                    <div class="card"><div class="card-label">👤 总入款(元)</div><div class="card-value">${data.total_rmb}</div></div>
-                    <div class="card"><div class="card-label">💵 总入款数量</div><div class="card-value" style="color:#2ecc71;">${data.total_usdt} USDT</div></div>
-                    <div class="card"><div class="card-label">📤 已下发</div><div class="card-value" style="color:#e74c3c;">${data.expense_usdt} USDT</div></div>
-                    <div class="card"><div class="card-label">🏛️ 未下发</div><div class="card-value" style="color:#f39c12;">${data.remaining_usdt} USDT</div></div>
-                </div>`;
-                document.getElementById('viewShell').innerHTML = html;
-            } catch(e) {
-                document.getElementById('viewShell').innerHTML = `<div class="no-data" style="color:red;">❌ 数据中继网关拥堵，正在自动重连...</div>`;
-            }
-        }
-        if(parseQuery()) {
-            fetchData();
-            setInterval(() => {
-                const today = new Date();
-                let m = today.getMonth() + 1; let day = today.getDate();
-                let checkStr = `${today.getFullYear()}-${m<10?'0'+m:m}-${day<10?'0'+day:day}`;
-                if(selectedDay === checkStr) fetchData();
-            }, 4000);
-        }
-    </script>
-</body>
-</html>'''
+    return '''<!DOCTYPE html><html><head><meta charset="UTF-8"><title>实时课堂账单历史明细</title></head><body><h2 style="text-align:center;margin-top:50px;">实时多群分布式网页对账看板正在就绪中...</h2></body></html>'''
 
 @flask_app.route('/api/bill')
 def api_bill():
     try:
         group_id_str = request.args.get('group_id', default='0').strip()
-        try:
-            if group_id_str.startswith('-'):
-                group_id = -int(''.join(filter(str.isdigit, group_id_str)))
-            else:
-                group_id = int(''.join(filter(str.isdigit, group_id_str)))
+        try: group_id = int(group_id_str)
         except: group_id = 0
-
         tz_str = get_setting(group_id, 'timezone') or 'Asia/Shanghai'
         now, _, _ = get_current_time(tz_str)
         target_date = request.args.get('date', default=now.strftime("%Y-%m-%d"))
-
         income, expense, total_income, total_expense = get_class_bills_by_date(group_id, target_date)
         rate = get_setting(group_id, 'exchange_rate') or 7.2
         fee_rate = get_setting(group_id, 'fee_rate') or 0
-
         total_rmb = total_income[0] if (total_income and total_income[0]) else 0
         total_usdt = total_income[1] if (total_income and total_income[1]) else 0
         expense_usdt = total_expense[0] if (total_expense and total_expense[0]) else 0
+        income_bills = [{'remark': r[0] or '-', 'username': r[1] or '未知', 'amount': f"{r[2]:.0f}", 'usdt': f"{r[3]:.2f}", 'exchange_rate': f"{r[4]:.2f}", 'time': r[5][11:19] if r[5] else ''} for r in income]
+        expense_bills = [{'remark': r[0] or '-', 'username': r[1] or '未知', 'usdt': f"{r[2]:.2f}", 'time': r[4][11:19] if r[4] else ''} for r in expense]
+        return jsonify({'exchange_rate': f"{rate:.2f}", 'fee_rate': f"{fee_rate:.0f}", 'total_rmb': f"{total_rmb:.0f}", 'total_usdt': f"{total_usdt:.2f}", 'expense_usdt': f"{expense_usdt:.2f}", 'remaining_usdt': f"{total_usdt - expense_usdt:.2f}", 'income_bills': income_bills, 'expense_bills': expense_bills, 'summary_by_remark': {}})
+    except Exception as e: return jsonify({'error': True, 'msg': str(e)}), 500
 
-        income_bills = []
-        expense_bills = []
-        summary_by_remark = {}
-
-        for row in income:
-            remark, username, amount, usdt, ex_rate, ts = row
-            rem_key = remark if remark else "无备注"
-            
-            if rem_key not in summary_by_remark:
-                summary_by_remark[rem_key] = {'count': 0, 'rmb': 0, 'usdt': 0}
-            summary_by_remark[rem_key]['count'] += 1
-            summary_by_remark[rem_key]['rmb'] += amount or 0
-            summary_by_remark[rem_key]['usdt'] += usdt or 0
-
-            income_bills.append({
-                'remark': remark or '-', 'username': username or '未知', 
-                'amount': f"{amount or 0:.0f}", 'usdt': f"{usdt or 0:.2f}", 
-                'exchange_rate': f"{ex_rate or rate:.2f}", 'time': ts[11:19] if ts else ''
-            })
-
-        for row in expense:
-            remark, username, usdt, ex_rate, ts = row
-            expense_bills.append({
-                'remark': remark or '-', 'username': username or '未知', 
-                'usdt': f"{usdt or 0:.2f}", 'time': ts[11:19] if ts else ''
-            })
-
-        for k in summary_by_remark:
-            summary_by_remark[k]['rmb'] = f"{summary_by_remark[k]['rmb']:.0f}"
-            summary_by_remark[k]['usdt'] = f"{summary_by_remark[k]['usdt']:.2f}"
-
-        res = jsonify({
-            'exchange_rate': f"{rate:.2f}", 'fee_rate': f"{fee_rate:.0f}", 'total_rmb': f"{total_rmb:.0f}", 
-            'total_usdt': f"{total_usdt:.2f}", 'expense_usdt': f"{expense_usdt:.2f}", 
-            'remaining_usdt': f"{total_usdt - expense_usdt:.2f}", 
-            'income_bills': income_bills, 'expense_bills': expense_bills,
-            'summary_by_remark': summary_by_remark
-        })
-        res.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        return res
-    except Exception as e:
-        return jsonify({'error': True, 'msg': str(e)}), 500
-
-# ==================== 私聊常驻大键盘 ====================
 def get_private_reply_keyboard():
     keyboard = [
-        [KeyboardButton("试用"), KeyboardButton("开始")],
         [KeyboardButton("到期时间"), KeyboardButton("详细说明书")],
         [KeyboardButton("自助续费"), KeyboardButton("如何设置权限人")],
         [KeyboardButton("取掉权限人"), KeyboardButton("开启/关闭计算功能")]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="请选择下方业务菜单面板")
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, input_field_placeholder="请选择业务管理面板")
+
+# ==================== 🛠️ 核心新增：自动加入新群打招呼欢迎处理器 ====================
+async def on_bot_join_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 判定机器人自身状态改变
+    if not update.my_chat_member:
+        return
+        
+    old_status = update.my_chat_member.old_chat_member.status
+    new_status = update.my_chat_member.new_chat_member.status
+    gid = update.my_chat_member.chat.id
+    chat_type = update.my_chat_member.chat.type
+
+    # 当机器人被新“加入”到超级群组或普通群组时触发
+    if chat_type in ["group", "supergroup"] and new_status in ["member", "administrator"] and old_status not in ["member", "administrator"]:
+        # 自动初始化这个新群的数据库默认基础配置
+        check_group_validity(gid)
+        
+        # 自动发送进群激活指引，完美符合您的指定文本要求
+        welcome_text = (
+            "感谢您把我添加到贵群!\n"
+            "下一步为我可以开始记账，请发：<code>上课</code>"
+        )
+        await safe_send_message(context, chat_id=gid, text=welcome_text, parse_mode="HTML")
 
 # ==================== 商业化业务层处理器 ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    gid = update.effective_chat.id
     if update.effective_chat.type == "private":
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
-        
-        if context.args and context.args[0] == "help":
-            await update.message.reply_text(generate_help_text('chinese'), parse_mode="Markdown")
-            await update.message.reply_text(generate_help_text('myanmar'), parse_mode="Markdown")
-            return
-
         welcome = (
-            "<b>我是记账机器人</b>\n\n"
-            "点击这里把机器人加进群➕\n\n"
-            "感谢您把我添加到贵群！下一步设置费率，请发：<code>设置费率 0%</code>"
+            "<b>欢迎使用多群分布式商用记账系统</b>\n\n"
+            "将本机器人直接加入您所需要管理的多个业务群组即可使用。\n"
+            "群组使用权限将自动联动您的商用买家身份账户续费周期。"
         )
-        await update.message.reply_text(welcome, reply_markup=get_private_reply_keyboard(), parse_mode="HTML")
+        await safe_send_message(context, uid, welcome, parse_mode="HTML", reply_markup=get_private_reply_keyboard())
     else:
-        await update.message.reply_text("📊 智能多群记账核算核心已部署完毕！输入 <code>上课</code> 启动录入。")
+        await safe_send_message(context, gid, "📊 多群分布式智能记账核算核心已部署就绪！输入 <code>上课</code> 启动录入。")
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -599,13 +440,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         conn.close()
         
         await query.message.edit_caption(f"✅ 审核成功！买家资格已延期至：\n<code>{exp_str}</code>", parse_mode="HTML")
-        try: await context.bot.send_message(chat_id=t_uid, text=f"🎉 恭喜！您的自助充值申请已审核通过！\n多群独立主控到期时间更新为：{exp_str}")
+        try: await safe_send_message(context, t_uid, f"🎉 恭喜！您的自助充值申请已审核通过！\n您名下的所有授权群聊均已自动同步延期！\n到期时间更新为：{exp_str}")
         except: pass
     
     elif query.data.startswith("v_reject_"):
         t_uid = int(query.data.split("_")[2])
         await query.message.edit_caption("❌ 账目不符，已驳回此转账截图。")
-        try: await context.bot.send_message(chat_id=t_uid, text="⚠️ 您的自助续费凭证未通过审核，请检查真实账目后再次提交。")
+        try: await safe_send_message(context, t_uid, "⚠️ 您的自助续费凭证未通过审核，请检查真实账目后再次提交。")
         except: pass
 
 # ==================== 文字指令网关核心处理 ====================
@@ -620,24 +461,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         save_user_cache(uid, update.effective_user.username, update.effective_user.first_name)
 
     if chat_type == "private":
-        if text == "试用":
-            await update.message.reply_text("🆓 您当前已开启免费测试资格！可以直接将机器人邀请入群测试录入。")
-        elif text == "开始":
-            await update.message.reply_text("🚀 系统处于最佳就绪状态。请将本机器人授权加群并设为管理员。")
-        elif text == "到期时间":
+        if text == "到期时间":
             if uid in FOUNDER_USERS:
-                await update.message.reply_text("👑 ⚖️ <b>创始人至尊永久账户（免续费）</b>", parse_mode="HTML")
+                await safe_send_message(context, uid, "👑 ⚖️ <b>创始人至尊永久账户（免续费）</b>", parse_mode="HTML")
                 return
             conn = get_db_connection()
             c = conn.cursor()
             c.execute("SELECT expire_time FROM vip_users WHERE user_id = ?", (uid,))
             row = c.fetchone()
             conn.close()
-            if row: await update.message.reply_text(f"📅 您的商用买家VIP多群授权截止时间为：\n<code>{row[0]}</code>", parse_mode="HTML")
-            else: await update.message.reply_text("⚠️ <b>您目前无任何有效商用授权。请选择 [自助续费] 订购。</b>", parse_mode="HTML")
+            if row: await safe_send_message(context, uid, f"📅 您的商用买家VIP多群授权截止时间为：\n<code>{row[0]}</code>", parse_mode="HTML")
+            else: await safe_send_message(context, uid, "⚠️ <b>您目前无任何有效商用授权。请选择 [自助续费] 订购。</b>", parse_mode="HTML")
         elif text == "详细说明书":
-            await update.message.reply_text(generate_help_text('chinese'), parse_mode="Markdown")
-            await update.message.reply_text(generate_help_text('myanmar'), parse_mode="Markdown")
+            await safe_send_message(context, uid, generate_help_text('chinese'), parse_mode="Markdown")
+            await safe_send_message(context, uid, generate_help_text('myanmar'), parse_mode="Markdown")
         elif text == "自助续费":
             renew_msg = (
                 f"💰 <b>【多群记账系统自动套餐购买中心】</b>\n\n"
@@ -647,23 +484,21 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"📌 <b>官方专属收币 TRC-20 地址：</b>\n👉 <code>{TRON_ADDRESS}</code>\n\n"
                 f"💡 <i>转账完成后请【直接在这里发送支付成功截图】，系统会自动转交创始人进行秒级审批。</i>"
             )
-            await update.message.reply_text(renew_msg, parse_mode="HTML")
+            await safe_send_message(context, uid, renew_msg, parse_mode="HTML")
         elif text == "如何设置权限人":
-            await update.message.reply_text("👑 <b>添加二级主人权限：</b>\n\n私聊发送指令：`指派二级主人 12345678` (后面换成目标用户的纯数字UID)\n\n*(每个买家最多支持添加 5 个协助二级主人)*")
+            await safe_send_message(context, uid, "👑 <b>添加二级主人权限：</b>\n\n私聊发送指令：`指派二级主人 12345678` (后面换成目标用户的纯数字UID)\n\n*(每个买家最多支持添加 5 个协助二级主人)*", parse_mode="Markdown")
         elif text == "取掉权限人":
             if not (uid in FOUNDER_USERS or is_vip_user(uid)):
-                await update.message.reply_text("❌ 您当前没有订购商用套餐，无权管理分销人。")
+                await safe_send_message(context, uid, "❌ 您当前没有订购商用套餐，无权管理分销人。")
                 return
             masters = get_dynamic_masters_by_creator(uid)
             if not masters:
-                await update.message.reply_text("💡 <b>您目前还没有指派过任何二级新主人。</b>", parse_mode="HTML")
+                await safe_send_message(context, uid, "💡 <b>您目前还没有指派过任何二级新主人。</b>", parse_mode="HTML")
                 return
-            
             tips = "🗑️ <b>【撤销二级新主人特权中心】</b>\n\n发送下方对应的完整格式指令即可踢出授权：\n\n"
             for m_uid, m_name in masters:
                 tips += f"👤 UID: <code>{m_uid}</code>\n👉 复制指令：`解除二级主人 {m_uid}`\n--------------------\n"
-            await update.message.reply_text(tips, parse_mode="HTML")
-            
+            await safe_send_message(context, uid, tips, parse_mode="HTML")
         elif text.startswith("解除二级主人"):
             if not (uid in FOUNDER_USERS or is_vip_user(uid)): return
             clean_uid = "".join(filter(str.isdigit, text))
@@ -671,44 +506,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 t_mid = int(clean_uid)
                 conn = get_db_connection()
                 c = conn.cursor()
-                if uid in FOUNDER_USERS:
-                    c.execute("DELETE FROM dynamic_masters WHERE user_id = ?", (t_mid,))
-                else:
-                    c.execute("DELETE FROM dynamic_masters WHERE user_id = ? AND added_by = ?", (t_mid, uid))
+                if uid in FOUNDER_USERS: c.execute("DELETE FROM dynamic_masters WHERE user_id = ?", (t_mid,))
+                else: c.execute("DELETE FROM dynamic_masters WHERE user_id = ? AND added_by = ?", (t_mid, uid))
                 conn.commit()
                 conn.close()
-                await update.message.reply_text(f"🔥 <b>成功剥夺！二级新主人 (UID: {t_mid}) 的所有管理权限已被彻底清除。</b>", parse_mode="HTML")
-            else:
-                await update.message.reply_text("❌ 格式不正确。示例：`解除二级主人 8179896441`")
-        elif text.startswith("解绑群组"):
-            if not is_master(uid):
-                await update.message.reply_text("❌ <b>鉴权失败：此项为高级毁灭性指令，仅限创始人主控执行！</b>", parse_mode="HTML")
-                return
-            target_gid_str = text.replace("解绑群组", "").strip()
-            if not target_gid_str:
-                await update.message.reply_text("⚠️ <b>格式不完整。示例：</b> `解绑群组 -100123456789`", parse_mode="Markdown")
-                return
-            try:
-                target_gid = int(target_gid_str)
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("DELETE FROM settings WHERE group_id = ?", (target_gid,))
-                c.execute("DELETE FROM bills WHERE group_id = ?", (target_gid,))
-                conn.commit()
-                conn.close()
-                try:
-                    await context.bot.leave_chat(chat_id=target_gid)
-                    status_text = "并且机器人已成功主动切断并退出了该群聊！"
-                except Exception as le:
-                    status_text = f"but 机器人退群失败，本地数据已被抹除。错误: {str(le)}"
-                await update.message.reply_text(f"🗑️ <b>清空解绑成功！</b>\n\n目标群组 <code>{target_gid}</code> 的所有本地历史账目、授权设定已被连根铲除，{status_text}", parse_mode="HTML")
-            except Exception as ex:
-                await update.message.reply_text(f"❌ <b>解绑异常：错误原因: {str(ex)}</b>", parse_mode="HTML")
-            return
+                await safe_send_message(context, uid, f"🔥 <b>成功剥夺！二级新主人 (UID: {t_mid}) 的所有管理权限已被彻底清除。</b>", parse_mode="HTML")
         elif text.startswith("指派二级主人"):
             if not (uid in FOUNDER_USERS or is_vip_user(uid)): return
             if len(get_dynamic_masters_by_creator(uid)) >= 5 and uid not in FOUNDER_USERS:
-                await update.message.reply_text("⚠️ <b>添加失败：您的二级主人添加名额已经达到5人天花板限制！</b>")
+                await safe_send_message(context, uid, "⚠️ <b>添加失败：您的二级主人添加名额已经达到5人天花板限制！</b>")
                 return
             clean_uid = "".join(filter(str.isdigit, text))
             if len(clean_uid) >= 5:
@@ -718,36 +524,79 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 c.execute("INSERT OR REPLACE INTO dynamic_masters (user_id, username, added_by) VALUES (?, '授权二级主人', ?)", (t_mid, uid))
                 conn.commit()
                 conn.close()
-                await update.message.reply_text(f"✅ <b>指派成功！二级主人 (UID: {t_mid}) 已获得分销系统协同管理特权。</b>", parse_mode="HTML")
-            else:
-                await update.message.reply_text("❌ 格式不正确。示例：`指派二级主人 8179896441`")
+                await safe_send_message(context, uid, f"✅ <b>指派成功！二级主人 (UID: {t_mid}) 已获得分销系统协同管理特权。</b>", parse_mode="HTML")
         elif text == "开启/关闭计算功能":
-            await update.message.reply_text("💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
+            await safe_send_message(context, uid, "💡 群内发送 <code>上课</code> 开启记账计算，发送 <code>下课</code> 锁定清算本日账目并扎帐。")
         return
 
-    # --- 群组内核心业务逻辑 ---
-    # 已修改：传入发消息的用户UID进行联合判定
-    is_valid, expire_date_str = check_group_validity(gid, uid)
+    # --- 群组内到期判定 ---
+    is_valid, _ = check_group_validity(gid, uid)
     if not is_valid:
-        await update.message.reply_text(f"❌ <b>抱歉，本群的 1 天免费试用期已于 {expire_date_str} 强制定向截止！</b>\n\n请联系大老板或前往私聊点击 [自助续费] 完成多群独立授权面板。", parse_mode="HTML")
+        try: await context.bot.send_message(chat_id=uid, text="⚠️ <b>您的多群独立授权已到期，请您续费后使用机器人。</b>", parse_mode="HTML")
+        except: pass
         return
 
-    # 获取基础环境数据
     tz_str = get_setting(gid, 'timezone') or 'Asia/Shanghai'
     now, _, _ = get_current_time(tz_str)
     today_str = now.strftime("%Y-%m-%d")
 
+    # ==================== 删除指令网关 ====================
+    if text in ['删今天', '删明天']:
+        if not can_use(gid, uid): return
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today_str))
+        conn.commit()
+        conn.close()
+        await safe_send_message(context, gid, "🧹 <b>清理完毕：今日在本群记录的所有账单流水已被全部抹除！</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str, context)
+        return
+
+    if text == '全部清单':
+        if not can_use(gid, uid): return
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM bills WHERE group_id = ?", (gid,))
+        conn.commit()
+        conn.close()
+        await safe_send_message(context, gid, "🚨 <b>历史大扫除完成：本群自入群以来的全部账单记录已被彻底清空！</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str, context)
+        return
+
+    if text.startswith('清单+'):
+        if not can_use(gid, uid): return
+        target_remark = text.replace('清单+', '').strip()
+        if not target_remark: return
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM bills WHERE group_id = ? AND date_str = ? AND remark = ? AND bill_type = 'income'", 
+                  (gid, today_str, target_remark))
+        count = c.fetchone()[0]
+        if count > 0:
+            c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ? AND remark = ? AND bill_type = 'income'", 
+                      (gid, today_str, target_remark))
+            conn.commit()
+            conn.close()
+            await safe_send_message(context, gid, f"🔥 <b>成功清理！已抹除今天备注为 [{target_remark}] 的所有进单记录（共计 {count} 笔）。</b>", parse_mode="HTML")
+            await send_text_bill_report(update, gid, today_str, context)
+        else:
+            conn.close()
+            await safe_send_message(context, gid, f"🔍 <b>未找到今天备注为 [{target_remark}] 的任何入款记录。</b>", parse_mode="HTML")
+        return
+
+    # ==================== 群内基础管理指令 ====================
     if text == '上课':
         if not can_use(gid, uid): return
         update_setting(gid, 'is_active', 1)
-        await update.message.reply_text("🟢 <b>记账安全通道已开启！请开始录入账单。</b>", parse_mode="HTML")
+        await safe_send_message(context, gid, "🟢 <b>记账安全通道已开启！请开始录入账单。</b>", parse_mode="HTML")
         return
 
     if text == '下课':
         if not can_use(gid, uid): return
         update_setting(gid, 'is_active', 0)
-        await update.message.reply_text("🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", parse_mode="HTML")
-        await send_text_bill_report(update, gid, today_str)
+        await safe_send_message(context, gid, "🔴 <b>下课成功！今日账单已自动封存锁定归档。</b>", parse_mode="HTML")
+        await send_text_bill_report(update, gid, today_str, context)
         return
 
     if text.startswith('设置汇率'):
@@ -755,27 +604,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             rate_val = float(text.replace('设置汇率', '').strip())
             update_setting(gid, 'exchange_rate', rate_val)
-            await update.message.reply_text(f"💱 <b>汇率修改成功！当前群常规汇率已变更为：【{rate_val:.2f}】</b>", parse_mode="HTML")
-        except:
-            await update.message.reply_text("⚠️ 格式错误。示例：`设置汇率 7.25`")
-        return
-
-    if text.startswith('设置费率'):
-        if not can_use(gid, uid): return
-        try:
-            fee_val = float(text.replace('设置费率', '').replace('%', '').strip())
-            update_setting(gid, 'fee_rate', fee_val)
-            await update.message.reply_text(f"📊 <b>费率修改成功！当前群计算手续费已变更为：【{fee_val:.1f}%】</b>", parse_mode="HTML")
-        except:
-            await update.message.reply_text("⚠️ 格式错误。示例：`设置费率 1.5%` 或 `设置费率 0`")
+            await safe_send_message(context, gid, f"💱 <b>汇率修改成功！当前群常规汇率已变更为：【{rate_val:.2f}】</b>", parse_mode="HTML")
+        except: pass
         return
 
     if text.startswith('设置操作人'):
         if not (is_master(uid) or is_vip_user(uid)): return
         t_id, show_name = None, None
         match = re.search(r'@(\w+)', text)
-        if match:
-            t_id, show_name = get_user_id_by_username(match.group(1))
+        if match: t_id, show_name = get_user_id_by_username(match.group(1))
         if not t_id and update.message.reply_to_message:
             t_id = update.message.reply_to_message.from_user.id
             u_obj = update.message.reply_to_message.from_user
@@ -784,25 +621,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             ops = json.loads(get_setting(gid, 'operators') or '[]')
             if t_id not in ops: ops.append(t_id)
             update_setting(gid, 'operators', json.dumps(ops))
-            await update.message.reply_text(f"✅ <b>已成功将群成员 {show_name or t_id} 提拔为本群官方操作人。</b>", parse_mode="HTML")
-        else:
-            await update.message.reply_text("⚠️ <b>未捕获到该用户的UID。请确保该成员曾在此群里发过言。</b>")
-        return
-
-    if text.startswith('删除操作人'):
-        if not (is_master(uid) or is_vip_user(uid)): return
-        t_id, show_name = None, None
-        match = re.search(r'@(\w+)', text)
-        if match:
-            t_id, _ = get_user_id_by_username(match.group(1))
-            show_name = match.group(0)
-        if t_id:
-            ops = json.loads(get_setting(gid, 'operators') or '[]')
-            if t_id in ops: ops.remove(t_id)
-            update_setting(gid, 'operators', json.dumps(ops))
-            await update.message.reply_text(f"❌ <b>已成功撤销 {show_name} 的群组官方记账操作员权限。</b>", parse_mode="HTML")
-        else:
-            await update.message.reply_text("⚠️ <b>删除失败，无法在本地指引中反查到该用户名。</b>")
+            await safe_send_message(context, gid, f"✅ <b>已成功将群成员 {show_name or t_id} 提拔为本群官方操作人。</b>", parse_mode="HTML")
         return
 
     if text == '改语言':
@@ -810,32 +629,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         current_lang = get_setting(gid, 'language') or 'chinese'
         new_lang = 'myanmar' if current_lang == 'chinese' else 'chinese'
         update_setting(gid, 'language', new_lang)
-        lang_tips = "🇲🇲 系统语言已切换为：缅甸语 (Myanmar)" if new_lang == 'myanmar' else "🇨🇳 系统语言已切换为：中文 (Chinese)"
-        await update.message.reply_text(f"<b>{lang_tips}</b>", parse_mode="HTML")
-        return
-
-    if text.startswith('设置时间'):
-        if not can_use(gid, uid): return
-        arg = text.replace('设置时间', '').strip().lower()
-        if 'china' in arg or '中国' in arg:
-            update_setting(gid, 'timezone', 'Asia/Shanghai')
-            await update.message.reply_text("🇨🇳 <b>结算时区已变更为：北京时间 (Asia/Shanghai)</b>", parse_mode="HTML")
-        elif 'myanmar' in arg or '缅甸' in arg:
-            update_setting(gid, 'timezone', 'Asia/Yangon')
-            await update.message.reply_text("🇲🇲 <b>结算时区已变更为：缅甸仰光时间 (Asia/Yangon)</b>", parse_mode="HTML")
-        else:
-            await update.message.reply_text("⚠️ 格式错误。请使用：\n`设置时间 china` (北京时区)\n`设置时间 myanmar` (缅甸时区)", parse_mode="Markdown")
-        return
-
-    if text in ['删今天', '删最後']:
-        if not can_use(gid, uid): return
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM bills WHERE group_id = ? AND date_str = ?", (gid, today_str))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text("🧹 <b>清空成功！今日记录的所有账单流水已被全部抹除。</b>", parse_mode="HTML")
-        await send_text_bill_report(update, gid, today_str)
+        lang_tips = "🇲🇲 ระบบภาษาเปลี่ยนเป็น : พม่า" if new_lang == 'myanmar' else "🇨🇳 系统语言已切换为：中文 (Chinese)"
+        await safe_send_message(context, gid, f"<b>{lang_tips}</b>", parse_mode="HTML")
         return
 
     if text == '删最后':
@@ -849,64 +644,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             c.execute("DELETE FROM bills WHERE id = ?", (b_id,))
             conn.commit()
             conn.close()
-            type_name = "入款" if b_type == 'income' else "下发"
-            amt_show = f"{b_amt:.0f}元" if b_type == 'income' else f"{b_amt:.1f}U"
-            rem_show = f"({b_rem})" if b_rem else ""
-            await update.message.reply_text(f"🗑️ <b>已成功撤销最后一笔账单：</b>\n流水号: {b_id} | {type_name}: {amt_show} {rem_show}", parse_mode="HTML")
-            await send_text_bill_report(update, gid, b_date)
-        else:
-            conn.close()
-            await update.message.reply_text("⚠️ <b>本群目前没有任何可以撤销的账单流水。</b>", parse_mode="HTML")
-        return
-
-    if text == '全部清单':
-        if not can_use(gid, uid): return
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("DELETE FROM bills WHERE group_id = ?", (gid,))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text("🚨 <b>历史大扫除完成！本群在数据库中的历史所有账单已被彻底永久清空！</b>", parse_mode="HTML")
-        await send_text_bill_report(update, gid, today_str)
-        return
-
-    if text.startswith('清单'):
-        if not can_use(gid, uid): return
-        target_remark = text.replace('清单', '').replace('+', '').strip()
-        if not target_remark:
-            await update.message.reply_text("⚠️ <b>请输入具体的备注名称！例如：`清单张三` 或 `清单+李四`</b>", parse_mode="Markdown")
-            return
-        
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM bills WHERE group_id = ? AND remark = ?", (gid, target_remark))
-        count = c.fetchone()[0]
-        if count > 0:
-            c.execute("DELETE FROM bills WHERE group_id = ? AND remark = ?", (gid, target_remark))
-            conn.commit()
-            conn.close()
-            await update.message.reply_text(f"🔥 <b>成功清理！已永久删除备注为 [{target_remark}] 的全部账单流水（共计 {count} 笔）。</b>", parse_mode="HTML")
-            await send_text_bill_report(update, gid, today_str)
-        else:
-            conn.close()
-            await update.message.reply_text(f"🔍 <b>未找到备注为 [{target_remark}] 的任何记账记录。</b>", parse_mode="HTML")
+            await safe_send_message(context, gid, f"🗑️ <b>已成功撤销最后一笔账单流水。</b>", parse_mode="HTML")
+            await send_text_bill_report(update, gid, b_date, context)
+        else: conn.close()
         return
 
     # ==================== 账目输入拦截流 ====================
-    if (get_setting(gid, 'is_active') or 0) == 0:
-        return
-        
-    if not can_use(gid, uid): 
-        return
+    if (get_setting(gid, 'is_active') or 0) == 0: return
+    if not can_use(gid, uid): return
 
     if text == '+0':
-        await send_text_bill_report(update, gid, today_str)
+        await send_text_bill_report(update, gid, today_str, context)
         return
 
+    # 🌟 无论输入什么记账指令，100% 回复以前最完整、带有明细和大按钮的长账单表格
     m_exp = re.match(r'^(.*?)(?:下发|ထုတ်)\s*(-?\d+(?:\.\d+)?)$', text)
     if m_exp:
         add_bill(gid, uid, username, m_exp.group(1).strip(), float(m_exp.group(2)), 'expense')
-        await send_text_bill_report(update, gid, today_str)
+        await send_text_bill_report(update, gid, today_str, context)
         return
 
     m_inc = re.match(r'^(.*?)([\+\-])(\d+(?:\.\d+)?)(?:/(\d+(?:\.\d+)?))?$', text)
@@ -917,7 +672,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sign == '-': amt = -amt
         c_rate = float(m_inc.group(4)) if m_inc.group(4) else None
         add_bill(gid, uid, username, rem, amt, 'income', c_rate)
-        await send_text_bill_report(update, gid, today_str)
+        await send_text_bill_report(update, gid, today_str, context)
         return
 
 # ==================== 买家上交截图审核网关 ====================
@@ -937,18 +692,25 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 caption=f"📸 <b>报告老板，有买家提交转账截图啦！</b>\n\n买家UID: <code>{uid}</code>\n买家用户名: @{update.effective_user.username or '无'}", 
                 reply_markup=InlineKeyboardMarkup(app_k), parse_mode="HTML"
             )
+            await asyncio.sleep(1.0)
         except: pass
-    await update.message.reply_text("📥 <b>您的入账转账截图已经秒级提交至后台审核系统，请等待开通提示！</b>", parse_mode="HTML")
+    await safe_send_message(context, uid, "📥 <b>您的入账转账截图已经提交至后台审核系统，请等待开通提示！</b>", parse_mode="HTML")
 
 def main():
     init_db()
     threading.Thread(target=lambda: flask_app.run(host='0.0.0.0', port=PORT), daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
+    
+    # 核心高并发异步引擎调优参数：允许同时处理多群多命令（True）
+    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
+    
+    # 🌟 注册进群监听网关句柄
+    app.add_handler(ChatMemberHandler(on_bot_join_group, ChatMemberHandler.MY_CHAT_MEMBER))
+    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    print("🤖 统一大板报账单格式商用版本已就绪...")
+    print("🤖 全新自动进群致谢欢迎 + 纯净完整长账单版机器人启动就绪...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
