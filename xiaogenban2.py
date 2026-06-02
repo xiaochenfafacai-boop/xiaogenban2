@@ -134,30 +134,57 @@ def is_vip_user(user_id):
     return False
 
 def check_group_validity(group_id):
+    """
+    核心鉴权：只要买家老板没过期，所有绑定的群都绝对不能过期！
+    """
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT expire_time FROM settings WHERE group_id = ?", (group_id,))
+    
+    # 1. 查找当前群组绑定的买家/老板 (creator_id) 以及群自身的试用时间
+    c.execute("SELECT creator_id, expire_time FROM settings WHERE group_id = ?", (group_id,))
     row = c.fetchone()
     
     if not row:
-        tz_str = 'Asia/Shanghai'
-        _, _, trial_expire = get_current_time(tz_str)
-        trial_expire = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO settings (group_id, operators, exchange_rate, fee_rate, is_active, language, timezone, show_usdt, expire_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  (group_id, '[]', 7.2, 0, 0, 'chinese', 'Asia/Shanghai', 1, trial_expire))
-        conn.commit()
         conn.close()
-        return True, trial_expire
-
-    conn.close()
-    group_expire_str = row[0]
+        return True, "新群初始化"
+        
+    creator_id, group_expire_str = row
     
-    if group_expire_str:
+    # 2. 🔥 核心联动买家身份：如果这个群属于某个买家，直接以买家的 VIP 有效期为准！
+    if creator_id:
+        # 如果是创始人，直接永久放行
+        if int(creator_id) in FOUNDER_USERS:
+            conn.close()
+            return True, "创始人永久授权"
+            
+        # 去 vip_users 表里反查这位买家老板的到期时间
+        c.execute("SELECT expire_time FROM vip_users WHERE user_id = ?", (creator_id,))
+        vip_row = c.fetchone()
+        
+        if vip_row:
+            vip_expire_str = vip_row[0]
+            try:
+                vip_expire = datetime.strptime(vip_expire_str, "%Y-%m-%d %H:%M:%S")
+                # 核心判断：只要当前时间还没到买家购买的截止时间，所有群一律放行！
+                if datetime.now() < vip_expire:
+                    conn.close()
+                    return True, vip_expire_str  # 共享买家尊贵的 VIP 时间
+            except Exception as e:
+                logging.error(f"解析买家时间失败: {e}")
+
+    # 3. 如果该群没有绑定任何买家老板（散客群），才走群组自身的 1 天试用期判定
+    conn.close()
+    if not group_expire_str:
+        return True, "未设置限制"
+        
+    try:
         group_expire = datetime.strptime(group_expire_str, "%Y-%m-%d %H:%M:%S")
         if datetime.now() < group_expire:
             return True, group_expire_str
-            
-    return False, group_expire_str
+        else:
+            return False, group_expire_str
+    except:
+        return True, "时间格式错误跳过"
 
 def can_use(group_id, user_id):
     if is_master(user_id) or is_vip_user(user_id): return True
